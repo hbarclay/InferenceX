@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import os
+import time
 from importlib import import_module
 
 import torch
 
 from operatorx.core import BackendImpl, Op, Result, UnsupportedOpError
 
-_BACKENDS = ["torch", "deepgemm", "flashinfer", "deepep", "sglang", "flashinfer_comm", "sglang_comm"]
+# Backends are DISCOVERED, not hardcoded: every module under
+# operatorx/runners/nvidia/backends/ is a backend (matches main.py).
+def _discover() -> list[str]:
+    import pkgutil
+    from operatorx.runners.nvidia import backends as _pkg
+    return sorted(i.name for i in pkgutil.iter_modules(_pkg.__path__)
+                  if not i.name.startswith("_"))
 _DISPATCH: dict[tuple[str, str], BackendImpl] = {}
 _L2_BUF: dict[int, torch.Tensor] = {}
 
@@ -14,7 +22,7 @@ _L2_BUF: dict[int, torch.Tensor] = {}
 def _load() -> None:
     if _DISPATCH:
         return
-    for name in _BACKENDS:
+    for name in _discover():
         try:
             mod = import_module(f"operatorx.runners.nvidia.backends.{name}")
         except ImportError:
@@ -37,6 +45,16 @@ def _clear_l2() -> None:
 _WARMUP = 5
 _ITERS = 10
 _NUM_BUFFER_SETS = 1
+
+# Idle time between test cases, as a multiple of the GPU-busy time just spent.
+# Without it a long sweep drives average power into the board's software power
+# cap (SwPowerCap) and the SM clock drops well below boost -- measurements taken
+# in that state are NOT peak. Sleeping proportionally keeps the duty cycle low
+# enough that every op starts at full boost clocks. Per-op sleep is capped so a
+# handful of very large shapes can't stretch the sweep unbounded.
+# Tune/disable with OPERATORX_COOLDOWN_RATIO (0 = off).
+_COOLDOWN_RATIO = float(os.environ.get("OPERATORX_COOLDOWN_RATIO", "4"))
+_COOLDOWN_MAX_S = float(os.environ.get("OPERATORX_COOLDOWN_MAX_S", "1.0"))
 
 def run(op: Op) -> Result:
     _load()
@@ -63,4 +81,11 @@ def run(op: Op) -> Result:
 
     times = sorted(starts[i].elapsed_time(ends[i]) * 1000.0 for i in range(_ITERS))
     median_us = times[_ITERS // 2]
+
+    # Let the board shed the power it just drew before the next test case, so
+    # the next measurement also starts at boost clocks (see _COOLDOWN_RATIO).
+    if _COOLDOWN_RATIO > 0.0:
+        busy_s = median_us * 1e-6 * (_ITERS + _WARMUP)
+        time.sleep(min(busy_s * _COOLDOWN_RATIO, _COOLDOWN_MAX_S))
+
     return Result(op=op, metrics={"latency_us": median_us})

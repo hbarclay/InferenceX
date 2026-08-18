@@ -23,6 +23,7 @@ import importlib
 import json
 import os
 import pkgutil
+import sys
 from pathlib import Path
 
 import operatorx.ops  # noqa: F401  populates op registry
