@@ -327,7 +327,115 @@ def _kernel_moe_forward(ctx: dict) -> None:
         ctx["out"] = ctx["moe"].forward_normal(ctx["x"])
 
 
+
+
+def _grouped_sizes(a: dict):
+    from operatorx.core import UnsupportedOpError
+    gs = [int(x) for x in a["group_sizes"]]
+    if not gs or any(x < 0 for x in gs):
+        raise UnsupportedOpError(f"bad group_sizes (len={len(gs)})")
+    m_total = sum(gs)
+    if m_total <= 0:
+        raise UnsupportedOpError("group_sizes sum to 0")
+    return gs, m_total, len(gs)
+
+
+def _prepare_grouped_gemm(op: Op) -> dict:
+    """Ragged X[M_total,K] @ W[G,K,N] with an explicit per-group row split.
+
+    fp8 pairs run sgl_kernel.fp8_blockwise_scaled_grouped_mm exactly as
+    sglang's cutlass MoE path drives it (per-token-group-128 activation
+    scales, 128x128 weight block scales). bf16 pairs run torch._grouped_mm —
+    the shared PyTorch grouped entrypoint; sglang ships no bf16 grouped mm.
+    Weight quantization happens here (untimed); a bf16 activation against fp8
+    weights is quantized per call INSIDE the timed region, matching serving.
+    """
+    from operatorx.core import UnsupportedOpError
+    a = op.args
+    gs, m_total, g = _grouped_sizes(a)
+    n, k = a["n"], a["k"]
+    da, db = a["dtype_a"], a["dtype_b"]
+    dev = "cuda"
+
+    if da == "bf16" and db == "bf16":
+        x = torch.randn(m_total, k, dtype=torch.bfloat16, device=dev)
+        w = torch.randn(g, k, n, dtype=torch.bfloat16, device=dev)
+        offs = torch.cumsum(torch.tensor(gs, device=dev), 0).to(torch.int32)
+        torch._grouped_mm(x, w, offs=offs)  # availability check, untimed
+        return {"kind": "grouped_bf16", "x": x, "w": w, "offs": offs}
+
+    if db == "fp8" and da in ("bf16", "fp8"):
+        import sgl_kernel
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8)
+        if n % 128 or k % 128:
+            raise UnsupportedOpError(
+                f"sgl fp8 blockwise grouped mm needs n,k % 128 == 0; got n={n} k={k}")
+        fp8 = torch.float8_e4m3fn
+        # Weights: (G, K, N) view with 128x128 block scales (G, K/128, N/128),
+        # both built transposed then viewed — the layout the kernel expects.
+        w_hi = torch.randn(g, n, k, dtype=torch.bfloat16, device=dev)
+        wq = torch.empty(g, n, k, dtype=fp8, device=dev)
+        wscale = torch.empty(g, n // 128, k // 128, dtype=torch.float32, device=dev)
+        for e in range(g):
+            blocks = w_hi[e].view(n // 128, 128, k // 128, 128).permute(0, 2, 1, 3)
+            sc = (blocks.abs().amax(dim=(2, 3)).float() / 448.0).clamp(min=1e-6)
+            wscale[e] = sc
+            wq[e] = (blocks / sc.unsqueeze(2).unsqueeze(3)).permute(0, 2, 1, 3) \
+                .reshape(n, k).to(fp8)
+        w_kn = wq.transpose(1, 2)                    # (G, K, N) view
+        wscale_kn = wscale.transpose(1, 2)           # (G, K/128, N/128) view
+        x = torch.randn(m_total, k, dtype=torch.bfloat16, device=dev)
+        starts = torch.tensor([0] + list(torch.tensor(gs).cumsum(0)[:-1]),
+                              device=dev, dtype=torch.int32)
+        ps = torch.tensor([[m, n, k] for m in gs], device=dev, dtype=torch.int32)
+        a_strides = torch.full((g,), k, device=dev, dtype=torch.int64)
+        c_strides = torch.full((g,), n, device=dev, dtype=torch.int64)
+        ptr = lambda: torch.empty(g, dtype=torch.int64, device=dev)
+        ctx = {"kind": "grouped_fp8_blockwise", "w": w_kn, "ws": wscale_kn,
+               "starts": starts, "ps": ps, "a_strides": a_strides,
+               "c_strides": c_strides,
+               "a_ptrs": ptr(), "b_ptrs": ptr(), "out_ptrs": ptr(),
+               "a_scales_ptrs": ptr(), "b_scales_ptrs": ptr(),
+               "sfa": torch.empty(g, 5, dtype=torch.int, device=dev),
+               "sfb": torch.empty(g, 5, dtype=torch.int, device=dev),
+               "workspace": torch.empty(32 << 20, dtype=torch.uint8, device=dev),
+               "out": torch.empty(m_total, n, dtype=torch.bfloat16, device=dev),
+               "mm": sgl_kernel.fp8_blockwise_scaled_grouped_mm,
+               "quant": sglang_per_token_group_quant_fp8,
+               "act_quant": da == "bf16"}
+        if da == "bf16":
+            ctx["x"] = x
+        else:
+            xq, xs = sglang_per_token_group_quant_fp8(x, 128)
+            ctx["xq"], ctx["xs"] = xq, xs
+        _kernel_grouped_gemm(ctx)  # availability + layout check, untimed
+        return ctx
+
+    raise UnsupportedOpError(
+        f"sglang grouped_gemm: unsupported dtype pair {da}/{db} "
+        f"(sgl_kernel 0.5.x has no dense-grouped fp4 mm)")
+
+
+def _kernel_grouped_gemm(ctx: dict) -> None:
+    kind = ctx["kind"]
+    if kind == "grouped_bf16":
+        ctx["out"] = torch._grouped_mm(ctx["x"], ctx["w"], offs=ctx["offs"])
+    elif kind == "grouped_fp8_blockwise":
+        if ctx["act_quant"]:
+            xq, xs = ctx["quant"](ctx["x"], 128)
+        else:
+            xq, xs = ctx["xq"], ctx["xs"]
+        ctx["mm"](ctx["out"], ctx["a_ptrs"], ctx["b_ptrs"], ctx["out_ptrs"],
+                  ctx["a_scales_ptrs"], ctx["b_scales_ptrs"], xq, ctx["w"],
+                  xs, ctx["ws"], ctx["a_strides"], ctx["a_strides"],
+                  ctx["c_strides"], ctx["sfa"], ctx["sfb"], ctx["ps"],
+                  ctx["starts"], ctx["workspace"])
+
+
 IMPLS = [
     BackendImpl(op_type="gemm", prepare=_prepare_gemm, kernel=_kernel_gemm),
     BackendImpl(op_type="moe_forward", prepare=_prepare_moe_forward, kernel=_kernel_moe_forward),
+    BackendImpl(op_type="grouped_gemm", prepare=_prepare_grouped_gemm,
+                kernel=_kernel_grouped_gemm),
 ]
