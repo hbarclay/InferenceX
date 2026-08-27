@@ -43,6 +43,8 @@ def _clear_l2() -> None:
 
 
 _WARMUP = 5
+# Minimum wall-clock warmup per op (seconds); see the ramp note in _time_op.
+_WARMUP_MIN_S = float(os.environ.get("OPERATORX_WARMUP_MIN_S", "0.025"))
 _ITERS = 10
 _NUM_BUFFER_SETS = 1
 
@@ -69,6 +71,15 @@ def run(op: Op) -> Result:
     for i in range(_WARMUP):
         impl.kernel(ctxs[i % _NUM_BUFFER_SETS])
     torch.cuda.synchronize()
+    # Iteration-count warmup is microseconds for small ops -- far less than
+    # the SM clock ramp after the inter-case cooldown idle -- so their timed
+    # iterations can land mid-ramp and record isolated 2-4x outliers. Keep
+    # warming until a minimum wall time has passed so clocks settle first.
+    if _WARMUP_MIN_S > 0.0:
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < _WARMUP_MIN_S:
+            impl.kernel(ctxs[0])
+            torch.cuda.synchronize()
 
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(_ITERS)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(_ITERS)]
