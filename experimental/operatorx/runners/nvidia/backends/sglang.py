@@ -366,8 +366,12 @@ def _prepare_grouped_gemm(op: Op) -> dict:
 
     if db == "fp8" and da in ("bf16", "fp8"):
         import sgl_kernel
-        from sglang.srt.layers.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8)
+        try:  # moved in sglang >= 0.5.17
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8)
+        except ImportError:
+            from sglang.srt.layers.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8)
         if n % 128 or k % 128:
             raise UnsupportedOpError(
                 f"sgl fp8 blockwise grouped mm needs n,k % 128 == 0; got n={n} k={k}")
