@@ -46,6 +46,9 @@ _WARMUP = 5
 # Minimum wall-clock warmup per op (seconds); see the ramp note in _time_op.
 _WARMUP_MIN_S = float(os.environ.get("OPERATORX_WARMUP_MIN_S", "0.025"))
 _ITERS = 10
+# GPU spin cycles enqueued ahead of the timed loop (see the shield note in
+# _time_op); ~4M cycles is a few ms at boost clocks.
+_SHIELD_CYCLES = int(os.environ.get("OPERATORX_SHIELD_CYCLES", "4000000"))
 _NUM_BUFFER_SETS = 1
 
 # Idle time between test cases, as a multiple of the GPU-busy time just spent.
@@ -83,6 +86,13 @@ def run(op: Op) -> Result:
 
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(_ITERS)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(_ITERS)]
+    # Head-start shield: for microsecond kernels the start/end event pair is
+    # only tight if the GPU is still busy when the CPU enqueues it -- otherwise
+    # the bracket times the CPU's launch path (tens of us, and unbounded under
+    # driver-lock contention, e.g. a concurrent nvidia-smi poll). A few ms of
+    # enqueued GPU spin lets the CPU queue ALL timed iterations before the
+    # first one starts executing, making every bracket kernel-only.
+    torch.cuda._sleep(_SHIELD_CYCLES)
     for i in range(_ITERS):
         _clear_l2()
         starts[i].record()
