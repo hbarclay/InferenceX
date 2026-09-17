@@ -145,7 +145,11 @@ def _prepare_gemm(op: Op) -> dict:
         w_hi = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
         gs_x = (gmax / x_hi.abs().amax().float()).clamp(min=1e-6)
         gs_w = (gmax / w_hi.abs().amax().float()).clamp(min=1e-6)
-        xq, xs = vops.scaled_fp4_quant(x_hi, gs_x)
+        try:  # pre-Blackwell SKUs have no fp4 kernels; surface as unsupported
+            xq, xs = vops.scaled_fp4_quant(x_hi, gs_x)
+        except Exception as e:
+            raise UnsupportedOpError(
+                f"nvfp4 quant/mm unavailable on this SKU: {e}") from e
         wq, ws = vops.scaled_fp4_quant(w_hi, gs_w)
         alpha = (1.0 / (gs_x * gs_w)).to(torch.float32)
         # Some SKUs report fp4 support but ship no compiled kernel; the only
