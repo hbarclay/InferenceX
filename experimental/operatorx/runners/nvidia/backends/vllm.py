@@ -269,6 +269,13 @@ def _prepare_grouped_gemm(op: Op) -> dict:
         gmax = 448.0 * 6.0
         w_hi = torch.randn(g, n, k, dtype=torch.bfloat16, device=dev)
         gs_w = (gmax / w_hi.abs().amax(dim=(1, 2)).float()).clamp(min=1e-6)
+        # SKUs without fp4 tensor cores (e.g. sm90) fail here, not at the mm;
+        # surface that as unsupported rather than an error.
+        try:
+            vops.scaled_fp4_quant(w_hi[0], gs_w[0])
+        except Exception as e:
+            raise UnsupportedOpError(
+                f"nvfp4 quant/mm unavailable on this SKU: {e}") from e
         wq_l, wbs_l = [], []
         for e in range(g):
             q, bs = vops.scaled_fp4_quant(w_hi[e], gs_w[e])
