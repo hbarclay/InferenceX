@@ -6,6 +6,7 @@ from importlib import import_module
 
 import torch
 
+from operatorx.runners import profiling
 from operatorx.core import BackendImpl, Op, Result, UnsupportedOpError
 
 # Backends are DISCOVERED, not hardcoded: every module under
@@ -109,4 +110,8 @@ def run(op: Op) -> Result:
         busy_s = median_us * 1e-6 * (_ITERS + _WARMUP)
         time.sleep(min(busy_s * _COOLDOWN_RATIO, _COOLDOWN_MAX_S))
 
-    return Result(op=op, metrics={"latency_us": median_us})
+    metrics = {"latency_us": median_us}
+    prof = profiling.profile_op(lambda: impl.kernel(ctxs[0]))
+    if prof is not None:
+        metrics["profile"] = prof
+    return Result(op=op, metrics=metrics)
