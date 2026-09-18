@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 
 import torch
@@ -103,11 +104,16 @@ def profile_op(kernel_fn) -> dict | None:
 
     summary = {"iters": _ITERS, "kernels": out,
                "gpu_us_per_call": round(gpu_us, 3)}
-    if _TRACE_DIR and (_counter % _TRACE_EVERY) == 1:
-        os.makedirs(_TRACE_DIR, exist_ok=True)
-        dest = os.path.join(_TRACE_DIR, f"op{_counter:06d}.json")
-        os.replace(path, dest)
-        summary["trace"] = dest
-    else:
-        os.unlink(path)
+    try:
+        if _TRACE_DIR and (_counter % _TRACE_EVERY) == 1:
+            os.makedirs(_TRACE_DIR, exist_ok=True)
+            dest = os.path.join(_TRACE_DIR, f"op{_counter:06d}.json")
+            # shutil.move, not os.replace: the temp file lives on a different
+            # filesystem than the (typically bind-mounted) trace dir.
+            shutil.move(path, dest)
+            summary["trace"] = dest
+        else:
+            os.unlink(path)
+    except OSError as e:
+        summary["trace_error"] = str(e)[:120]
     return summary
