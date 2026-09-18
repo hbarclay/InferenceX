@@ -21,6 +21,21 @@ to the result metrics:
 OPERATORX_PROFILE_TRACE_DIR   keep full chrome traces here (default: off)
 OPERATORX_PROFILE_TRACE_EVERY keep every Nth op's trace (default 200)
 OPERATORX_PROFILE_ITERS       replay count under the profiler (default 3)
+OPERATORX_PROFILE_METRICS     comma-separated hardware-counter metrics
+                              (CUDA only, CUPTI range-profiler names such
+                              as dram__bytes_read.sum); adds a second
+                              replay pass and attaches
+                              metrics["profile"]["counters"] =
+                              {kernel_name: {metric: value_per_call}}
+OPERATORX_PROFILE_MARKERS     "1": skip torch.profiler and instead bracket
+                              the replay in an nvtx/roctx range named
+                              "opx<op_index>" so an EXTERNAL profiler
+                              (e.g. rocprofv3 --pmc --marker-trace) can
+                              attribute per-dispatch counters to ops; the
+                              summary then carries iters/op_index/marker
+                              only. Every summary carries "op_index",
+                              which is also the join key for such
+                              externally collected counters.
 
 Launch-config fields depend on what the platform's kineto backend reports;
 missing fields are simply absent. This is measurement-side instrumentation
@@ -39,6 +54,10 @@ PROFILE = os.environ.get("OPERATORX_PROFILE", "") == "1"
 _TRACE_DIR = os.environ.get("OPERATORX_PROFILE_TRACE_DIR") or None
 _TRACE_EVERY = int(os.environ.get("OPERATORX_PROFILE_TRACE_EVERY", "200"))
 _ITERS = int(os.environ.get("OPERATORX_PROFILE_ITERS", "3"))
+_METRICS = [m.strip() for m in
+            os.environ.get("OPERATORX_PROFILE_METRICS", "").split(",")
+            if m.strip()]
+_MARKERS = os.environ.get("OPERATORX_PROFILE_MARKERS", "") == "1"
 
 _ARG_FIELDS = (
     ("grid", "grid"),
@@ -53,12 +72,82 @@ _ARG_FIELDS = (
 _counter = 0
 
 
+def _markers_pass(kernel_fn) -> dict:
+    """Replay inside an nvtx/roctx range for an external profiler to catch."""
+    marker = f"opx{_counter:06d}"
+    torch.cuda.synchronize()
+    torch.cuda.nvtx.range_push(marker)
+    try:
+        for _ in range(_ITERS):
+            kernel_fn()
+        torch.cuda.synchronize()
+    finally:
+        torch.cuda.nvtx.range_pop()
+    return {"iters": _ITERS, "op_index": _counter, "marker": marker}
+
+
+def _counters_pass(kernel_fn) -> dict:
+    """Replay once more under the kineto range profiler for HW counters.
+
+    Returns {kernel_name: {metric: value_per_call}} (values summed over
+    the replays, then divided by _ITERS), or {"error": ...}.
+    """
+    try:
+        from torch._C._profiler import _ExperimentalConfig
+        exp = _ExperimentalConfig(profiler_metrics=_METRICS,
+                                  profiler_measure_per_kernel=True)
+        acts = [torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA]
+        with torch.profiler.profile(activities=acts,
+                                    experimental_config=exp) as prof:
+            for _ in range(_ITERS):
+                kernel_fn()
+            torch.cuda.synchronize()
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        try:
+            prof.export_chrome_trace(path)
+            events = json.load(open(path)).get("traceEvents", [])
+        finally:
+            os.unlink(path)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"[:200]}
+
+    out: dict[str, dict] = {}
+    counts: dict[str, int] = {}
+    for e in events:
+        a = e.get("args") or {}
+        vals = {m: a[m] for m in _METRICS if m in a}
+        if not vals:
+            continue
+        name = e.get("name", "")[:200]
+        k = out.setdefault(name, {})
+        counts[name] = counts.get(name, 0) + 1
+        for m, v in vals.items():
+            try:
+                k[m] = k.get(m, 0.0) + float(v)
+            except (TypeError, ValueError):
+                k[m] = v
+    for name, k in out.items():
+        for m, v in list(k.items()):
+            if isinstance(v, float):
+                k[m] = v / _ITERS
+        k["_ranges_per_call"] = round(counts[name] / _ITERS, 2)
+    return out
+
+
 def profile_op(kernel_fn) -> dict | None:
     """Replay kernel_fn under torch.profiler; return the summary dict."""
     global _counter
     if not PROFILE:
         return None
     _counter += 1
+    if _MARKERS:
+        try:
+            return _markers_pass(kernel_fn)
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"[:200],
+                    "op_index": _counter}
     acts = [torch.profiler.ProfilerActivity.CPU,
             torch.profiler.ProfilerActivity.CUDA]
     try:
@@ -103,7 +192,10 @@ def profile_op(kernel_fn) -> dict | None:
     out.sort(key=lambda x: -x["us_per_call"])
 
     summary = {"iters": _ITERS, "kernels": out,
-               "gpu_us_per_call": round(gpu_us, 3)}
+               "gpu_us_per_call": round(gpu_us, 3),
+               "op_index": _counter}
+    if _METRICS:
+        summary["counters"] = _counters_pass(kernel_fn)
     try:
         if _TRACE_DIR and (_counter % _TRACE_EVERY) == 1:
             os.makedirs(_TRACE_DIR, exist_ok=True)
