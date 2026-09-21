@@ -1,7 +1,7 @@
 schema: 2
 name: disagg-gb200-2p1d-dep16-dep32-c1280-mtp-kvoffload
 model:
-  path: deepseek-v4-pro
+  path: deepseek-v4-pro-0813
   container: dynamo-sglang
   precision: fp4
 identity:
