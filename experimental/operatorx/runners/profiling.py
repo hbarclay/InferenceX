@@ -58,6 +58,23 @@ _METRICS = [m.strip() for m in
             os.environ.get("OPERATORX_PROFILE_METRICS", "").split(",")
             if m.strip()]
 _MARKERS = os.environ.get("OPERATORX_PROFILE_MARKERS", "") == "1"
+# Cache flush before the marked replay (MB; 0 = off). External profilers
+# without their own cache control (rocprofv3) otherwise measure the replay
+# against caches warmed by the preceding timed loop. Size it to cover the
+# FULL cache hierarchy (incl. any memory-side cache), not just L2. The
+# flush runs OUTSIDE the marker range so its dispatch is not attributed.
+_FLUSH_MB = int(os.environ.get("OPERATORX_PROFILE_FLUSH_MB", "0"))
+_FLUSH_BUF = None
+
+
+def _flush_caches() -> None:
+    global _FLUSH_BUF
+    if _FLUSH_MB <= 0:
+        return
+    if _FLUSH_BUF is None:
+        _FLUSH_BUF = torch.empty(_FLUSH_MB << 20, dtype=torch.int8,
+                                 device="cuda")
+    _FLUSH_BUF.zero_()
 
 _ARG_FIELDS = (
     ("grid", "grid"),
@@ -75,6 +92,7 @@ _counter = 0
 def _markers_pass(kernel_fn) -> dict:
     """Replay inside an nvtx/roctx range for an external profiler to catch."""
     marker = f"opx{_counter:06d}"
+    _flush_caches()
     torch.cuda.synchronize()
     torch.cuda.nvtx.range_push(marker)
     try:
