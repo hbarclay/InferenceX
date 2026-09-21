@@ -28,8 +28,20 @@ if [ "${EVAL_ONLY}" = "true" ]; then
     CONTEXT_LENGTH="$EVAL_MAX_MODEL_LEN"
 fi
 
-# Start GPU monitoring (power, temperature, clocks every second)
 start_gpu_monitor
+
+LINEAR_ATTN_ARGS=()
+if [[ "$TP" == "2" && "$EP_SIZE" == "2" ]]; then
+    case "$CONC" in
+        16|32|64)
+            LINEAR_ATTN_ARGS=(
+                --linear-attn-backend triton
+                --linear-attn-decode-backend flashinfer
+                --linear-attn-prefill-backend flashinfer
+            )
+            ;;
+    esac
+fi
 
 set -x
 SGLANG_ENABLE_SPEC_V2=1 PYTHONNOUSERSITE=1 python3 -m sglang.launch_server --model-path=$MODEL --host=0.0.0.0 --port=$PORT \
@@ -40,6 +52,7 @@ SGLANG_ENABLE_SPEC_V2=1 PYTHONNOUSERSITE=1 python3 -m sglang.launch_server --mod
 --quantization modelopt_fp4 \
 --kv-cache-dtype fp8_e4m3 \
 --mamba-ssm-dtype bfloat16 \
+"${LINEAR_ATTN_ARGS[@]}" \
 --attention-backend trtllm_mha \
 --moe-runner-backend flashinfer_trtllm \
 --cuda-graph-max-bs $CONC \
@@ -59,7 +72,6 @@ SGLANG_ENABLE_SPEC_V2=1 PYTHONNOUSERSITE=1 python3 -m sglang.launch_server --mod
 
 SERVER_PID=$!
 
-# Wait for server to be ready
 wait_for_server_ready --port "$PORT" --server-log "$SERVER_LOG" --server-pid "$SERVER_PID"
 
 pip install -q datasets pandas
@@ -77,12 +89,10 @@ run_benchmark_serving \
     --result-dir /workspace/ \
     --use-chat-template
 
-# After throughput, run evaluation only if RUN_EVAL is true
 if [ "${RUN_EVAL}" = "true" ]; then
     run_eval --framework lm-eval --port "$PORT"
     append_lm_eval_summary
 fi
 
-# Stop GPU monitoring
 stop_gpu_monitor
 set +x

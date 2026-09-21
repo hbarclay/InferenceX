@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
 set -x
 
 # MiniMax-M3 NVFP4 B300 AgentX with EAGLE3-GQA and synthetic acceptance.
@@ -7,15 +7,12 @@ set -x
 
 source "$(dirname "$0")/../../benchmark_lib.sh"
 
-export EVAL_FRAMEWORK="lm-eval"
-
 check_env_vars MODEL TP CONC KV_OFFLOADING TOTAL_CPU_DRAM_GB RESULT_DIR DURATION
 
 DRAFT_MODEL="Inferact/MiniMax-M3-EAGLE3-GQA"
 NUM_SPEC_TOKENS=3
 # Golden AL for the GQA draft head: golden_al_distribution/minimaxm3_eagle3_gqa.yaml
-# minimax-m3.thinking_on[3]. The non-GQA curve (minimaxm3_eagle3.yaml) reads 2.83
-# at the same level -- that head is not what this script runs.
+# minimax-m3.thinking_on[3]. The non-GQA curve (minimaxm3_eagle3.yaml) reads 2.83.
 SYNTHETIC_ACCEPT_LEN=2.78
 
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
@@ -43,6 +40,7 @@ install_agentic_deps
 
 OFFLOAD_ARGS=()
 if require_agentic_kv_offload_backend vllm-simple; then
+    python3 "$(dirname "$0")/../../../runners/patch_vllm_simple_kv_offload.py"
     CPU_OFFLOAD_BYTES=$((TOTAL_CPU_DRAM_GB * 1024 * 1024 * 1024))
     export VLLM_USE_SIMPLE_KV_OFFLOAD=1
     OFFLOAD_CONFIG=$(printf \

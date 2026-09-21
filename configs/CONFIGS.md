@@ -79,8 +79,8 @@ Note: while not required, `entry-name` typically takes the format `<INFMAX_MODEL
 The below list describes what each field is:
 
 - `image`: The image used to serve the benchmark, e.g., `vllm/vllm-openai:v0.10.2`
-- `model`: The model to server, e.g., `openai/gpt-oss-120b`
-- `model-prefix`: The canonical InferenceMAX model prefix reference, i.e., `dsr1` for Deepseek, `gptoss` for gptoss-120b, etc. This value is used to decipher which script in `benchmarks/` should be used in order to launch the benchmark.
+- `model`: The model to serve, e.g., `deepseek-ai/DeepSeek-R1-0528`
+- `model-prefix`: The canonical InferenceMAX model prefix reference, i.e., `dsr1` for DeepSeek-R1 or `qwen3.5` for Qwen3.5. Consult `MODELS.md` for supported model/scenario combinations. This value is used to decipher which script in `benchmarks/` should be used in order to launch the benchmark.
 - `runner`: This is the runner label on which to run the benchmark. This must be a valid key under `labels` in `runners.yaml`.
   Agentic configs must use an exact `cluster:<name>` runner label, not a broad
   SKU or capacity label, so every search-space point runs on the same hardware
@@ -108,8 +108,8 @@ The below list describes what each field is:
       - (Optional) `router`: Router metadata containing exactly non-empty `name` and `version` strings.
       - (Optional) `kv-p2p-transfer`: Non-empty name of the engine used to move KV state between workers. It is valid only for `multinode: true` configs and does not carry version metadata.
       - (Optional) `pp`: Pipeline parallelism level. Default is 1. It must be a positive integer.
-      - (Optional) `dcp-size`: Decode context-parallel size. Default is 1. It must be a positive divisor of `tp`; DCP reuses the TP GPUs.
-      - (Optional) `pcp-size`: Prefill context-parallel size. Default is 1. A topology consumes `tp * pp * pcp-size` GPUs per worker; DCP does not add GPUs.
+      - (Optional) `dcp-size`: Decode context-parallel size. Default is 1. It must be a positive divisor of `tp`. DCP reuses the TP GPUs.
+      - (Optional) `pcp-size`: Prefill context-parallel size. Default is 1. A topology consumes `tp * pp * pcp-size` GPUs per worker. DCP does not add GPUs.
       - For single-node entries, set `pp`, `dcp-size`, and `pcp-size` directly in the search-space entry.
       - For multinode entries, set them independently inside each `prefill` and `decode` worker block. A worker pool allocates `num-worker * tp * pp * pcp-size` GPUs.
   - `agentic-coding`: Agentic trace replay benchmarks using real conversation traces. Each entry must have:
@@ -119,7 +119,7 @@ The below list describes what each field is:
 `router` and `kv-p2p-transfer` may be omitted independently. Router metadata
 requires non-empty `name` and `version` strings. Its `version` must be the
 component's exact release, package or wheel version, or source commit. Do not
-copy a container image name or image tag into `version`; container image
+copy a container image name or image tag into `version`. Container image
 references are rejected. `kv-p2p-transfer` is intentionally
 name-only and is reserved for `multinode: true` configurations. It may describe
 an aggregated multinode topology, but every `disagg: true` config must declare
@@ -131,19 +131,19 @@ declaring a field both at the top level and in any search-space entry is
 rejected. Search-space values may differ between entries.
 
 `kv-offload-backend` is separate from peer-to-peer transfer. It requires a
-non-empty `name`; `version` is optional because framework-native implementations
+non-empty `name`. Its `version` is optional because framework-native implementations
 such as vLLM's built-in offload backends and SGLang HiCache do not have an
 independent component version. Supply `version` for independently versioned
 backends such as LMCache or Mooncake. Additional keys and image references in
 `version` are rejected.
 
 Agentic duration is not a master YAML field. Matrix generation defaults agentic
-jobs to 3600 seconds; reusable workflow callers may override the `duration`
+jobs to 3600 seconds. Reusable workflow callers may override the `duration`
 input.
 
 Notes:
 - No extra fields besides the ones listed may be specified, or else the benchmarks will fail to run.
-- Setting the fields above only guarantees that their values are passed as environment variables to benchmark scripts. Single-node jobs receive `PP_SIZE`, `DCP_SIZE`, and `PCP_SIZE`; multinode jobs receive `PREFILL_PP_SIZE`, `PREFILL_DCP_SIZE`, `PREFILL_PCP_SIZE`, `DECODE_PP_SIZE`, `DECODE_DCP_SIZE`, and `DECODE_PCP_SIZE`. Actually using those variables is an implementation detail of the benchmark Bash script.
+- Setting the fields above only guarantees that their values are passed as environment variables to benchmark scripts. Single-node jobs receive `PP_SIZE`, `DCP_SIZE`, and `PCP_SIZE`. Multinode jobs receive `PREFILL_PP_SIZE`, `PREFILL_DCP_SIZE`, `PREFILL_PCP_SIZE`, `DECODE_PP_SIZE`, `DECODE_DCP_SIZE`, and `DECODE_PCP_SIZE`. Actually using those variables is an implementation detail of the benchmark Bash script.
 
 ## Runners
 
@@ -152,13 +152,13 @@ hardware facts in the repository. It has two top-level sections:
 
 ```yaml
 labels:
-  cluster:b300-nv:
-    - b300-nv_01
-    - b300-nv_02
+  cluster:b300-dsxe:
+    - b300-dsxe_00
+    - b300-dsxe_01
 
 hardware:
-  cluster:b300-nv:
-    available-cpu-dram-mib: 2964436
+  cluster:b300-dsxe:
+    available-cpu-dram-mib: 3977095
     gpus-per-node: 8
 ```
 
