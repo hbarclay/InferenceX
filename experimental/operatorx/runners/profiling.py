@@ -171,6 +171,10 @@ def profile_op(kernel_fn) -> dict | None:
     try:
         with torch.profiler.profile(activities=acts) as prof:
             for _ in range(_ITERS):
+                # optional per-replay cache flush (OPERATORX_PROFILE_FLUSH_MB):
+                # makes each replay cold; the flush shows up in the trace as a
+                # memset-style kernel and is excluded by name downstream
+                _flush_caches()
                 kernel_fn()
             torch.cuda.synchronize()
     except Exception as e:  # profiling must never fail the measurement
