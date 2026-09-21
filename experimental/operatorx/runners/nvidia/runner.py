@@ -10,7 +10,8 @@ from operatorx.runners import profiling
 from operatorx.core import BackendImpl, Op, Result, UnsupportedOpError
 
 # Backends are DISCOVERED, not hardcoded: every module under
-# operatorx/runners/nvidia/backends/ is a backend (matches main.py).
+# operatorx/runners/nvidia/backends/ is a backend (matches main.py), which
+# also covers upstream's list (torch/deepgemm/flashinfer/.../vllm).
 def _discover() -> list[str]:
     import pkgutil
     from operatorx.runners.nvidia import backends as _pkg

@@ -6,54 +6,72 @@
 
 ## 弃用公告
 
-InferenceX-e2e 运行在数量固定且有限的 GPU 资源池上，并由一支小型团队维护。每保留一个场景、精度或配方变体，都会占用集群机时与维护人力，而这些资源本可投入到新的前沿模型上。以下弃用即为释放这部分产能。若某项弃用移除的是 A/B 对照中的一个分支，我们保留并发布在帕累托前沿（Pareto frontier）上更优的那个分支。
+InferenceX-e2e 运行在数量固定且有限的 GPU 资源池上，并由一支小型团队维护。每保留一个场景、精度或配方变体，都会占用集群机时与维护人力，而这些资源本可投入到新的前沿模型上。以下弃用即为释放这部分产能。下线冗余的 A/B 基线时，我们会保留对帕累托前沿（Pareto frontier）有贡献的配置，无论其是否启用投机解码。
 
 ### 2026 年 8 月 3 日（星期一）
 
-**2026 年 8 月 3 日（星期一）**为下列场景、精度与配方变体的最后运行日，此后即告弃用。
+**2026 年 8 月 3 日（星期一）**为下方第一张表中场景与精度的最后运行日，此后即告弃用。独立 A/B 基线的下线另见该表下方说明。
 
-**已于 2026 年 8 月 4 日部分执行**（[#2493](https://github.com/SemiAnalysisAI/InferenceX/pull/2493)）：第一张表中的场景与精度下线已完成 —— 54 个配置键从启用的 master 配置中移除并归档至 [`configs/deprecated/`](configs/deprecated/)，其基准测试脚本亦移入同级 `deprecated/` 目录。第二张表中的投机解码 A/B 下线**尚未执行**，详见该表下方说明。
+**已于 2026 年 8 月 4 日部分执行**（[#2493](https://github.com/SemiAnalysisAI/InferenceX/pull/2493)）：第一张表中的场景与精度下线已完成。此次执行从启用的 master 配置中移除 54 个配置键并归档至 [`configs/deprecated/`](configs/deprecated/)，其基准测试脚本亦移入同级 `deprecated/` 目录。第二张表中的投机解码 A/B 下线**尚未执行**，详见该表下方说明。
 
 场景与精度下线：
 
 | 模型 | 弃用内容 | 保留内容 |
 |---|---|---|
 | MiniMax-M3（`minimaxm3`） | 单轮 8k1k | 智能体编码 |
-| Kimi-K2.5/2.6/2.7-Code（`kimik2.5`） | 智能体编码 | 单轮 8k1k，保留至 2026 年 8 月 6 日（见下文） |
+| Kimi-K2.5/2.6/2.7-Code（`kimik2.5`） | 智能体编码 | 无。单轮 8k1k 运行至 2026 年 8 月 6 日，已于 2026-08-07 退役（见下文） |
 | Qwen3.5-397B-A17B（`qwen3.5`） | 全部 **bf16** 配方，涵盖所有场景，NVIDIA 与 AMD 平台均在内 | fp8 与 fp4 配方 |
 
-投机解码（speculative decoding）A/B 对照下线 —— 下列每一组对照中，启用投机解码的分支都处于更优的帕累托前沿，因此我们停止运行非投机解码分支，仅发布投机解码分支：
+下方 A/B 下线针对的是仅为与投机解码（speculative decoding）对照而维护的独立非投机解码基线，不排除对帕累托前沿有贡献的非投机解码配置：
 
-| 模型 | 弃用分支 | 发布分支 |
+| 模型 | 待下线的独立 A/B 基线 | 对应投机解码分支 |
 |---|---|---|
 | DeepSeek-V4-Pro 1.6T（`dsv4`） | 智能体编码，非 MTP | 智能体编码，MTP |
 | Qwen3.5-397B-A17B（`qwen3.5`） | 智能体编码，非 MTP | 智能体编码，MTP |
 | MiniMax-M3（`minimaxm3`） | 智能体编码，非 EAGLE3 | 智能体编码，EAGLE3 |
 | GLM-5.2（`glm5.2`） | 智能体编码，非 MTP | 智能体编码，MTP |
-| Kimi-K3（`kimik3`） | 智能体编码，非 DSpark —— 自第 0 天（day 0）起即弃用 | 智能体编码，DSpark |
+| Kimi-K3（`kimik3`） | 智能体编码，独立非 DSpark 基线（自第 0 天起即不要求） | 智能体编码，DSpark |
 
-**状态：尚未执行。**上表中所有非投机解码智能体分支仍在运行。若此刻移除，MiniMax-M3 与 GLM-5.2 将没有任何启用配置（其 EAGLE3 与 MTP 智能体分支尚未合入），并会使 DeepSeek-V4-Pro 与 Qwen3.5 在 AMD 及 SGLang 上的智能体覆盖全部消失 —— 这些平台/引擎组合均无对应的 MTP 分支。待替代分支就绪后再执行本轮下线。
+**状态：基线下线尚未执行。** 只有受影响的模型、硬件与引擎具备替代覆盖后，才能下线冗余基线。对帕累托前沿有贡献的非投机解码配置仍需保留；仅有对应的投机解码分支，不足以成为移除它们的理由。
 
-**今后我们不再以 A/B 对照的方式基准测试「非投机解码 vs 投机解码」。**当初保留非投机解码分支，是把它当作中立基线：那时接受长度（AL）完全取决于提交方草稿头（draft head）的实际水平，导致各家投机解码数据之间无法横向比较。这一问题现已解决：[`golden_al_distribution/`](golden_al_distribution/) 为每个模型、thinking 模式与草稿长度各提交了一条黄金 AL 曲线，均在 SPEED-Bench `coding` 类别上测得；AgentX 通过合成接受（synthetic acceptance）将所有提交锁定到该曲线（vLLM 用 `synthetic_acceptance_length`，SGLang 用 `SGLANG_SIMULATE_ACC_LEN`，TensorRT-LLM 用 `TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`，等等）。既然已有公平且与引擎无关的接受目标，投机解码结果本身即可直接横向比较，单独保留一条非投机解码赛道已属冗余。因此，智能体编码配方一律仅在启用投机解码的条件下运行与发布 —— 具体为 MTP、EAGLE/EAGLE3、DSpark，或该模型自带的任何草稿方法 —— 非投机解码分支既不运行也不发布。新模型自第 0 天起即按此方式接入，Kimi-K3 即为一例。
+**今后我们不再仅为 A/B 对照而分别维护非投机解码与投机解码两条赛道。** 当初保留非投机解码分支，是把它当作中立基线。那时接受长度（AL）完全取决于提交方草稿头（draft head）的实际水平，导致各家投机解码数据之间无法横向比较。这一问题现已解决。[`golden_al_distribution/`](golden_al_distribution/) 为每个模型、thinking 模式与草稿长度各提交了一条黄金 AL 曲线，均在 SPEED-Bench `coding` 类别上测得。启用投机解码时，AgentX 通过合成接受（synthetic acceptance）将提交锁定到该曲线（vLLM 用 `synthetic_acceptance_length`，SGLang 用 `SGLANG_SIMULATE_ACC_LEN`，TensorRT-LLM 用 `TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`，等等）。既然已有公平且与引擎无关的接受目标，投机解码结果本身即可直接横向比较，独立的非投机解码基线已属冗余。包括 Kimi-K3 在内的新模型，自第 0 天起即不要求维护该独立基线。
+
+**无论是否启用投机解码，都发布最优的帕累托点。** 若关闭 MTP、EAGLE/EAGLE3、DSpark 或其他草稿方法能得到更优的运行点，例如高吞吐量场景，配方可以关闭投机解码。有效的非投机解码结果仍可按相同的[北极星帕累托策略](#北极星帕累托策略)参与发布。因此，同一条前沿可以同时包含投机解码和非投机解码数据点。
 
 ### 2026 年 8 月 6 日（星期四）
 
-**2026 年 8 月 6 日（星期四）**为 **Kimi-K2.5/2.6/2.7-Code**（`kimik2.5`）**单轮 8k1k** 场景的最后运行日，此后该场景对这些模型弃用。原因：Kimi-K3 已于 2026 年 7 月 27 日发布，GPU 集群时间将转向更新的前沿模型。叠加上文的智能体编码弃用，`kimik2.5` 将不再有任何启用场景 —— 该模型将于 **2026 年 8 月 6 日后完全退役**。
+**2026 年 8 月 6 日（星期四）**为 **Kimi-K2.5/2.6/2.7-Code**（`kimik2.5`）**单轮 8k1k** 场景的最后运行日，此后该场景对这些模型弃用。原因：Kimi-K3 已于 2026 年 7 月 27 日发布，GPU 集群时间将转向更新的前沿模型。叠加上文的智能体编码弃用，`kimik2.5` 将不再有任何启用场景。该模型将于 **2026 年 8 月 6 日后完全退役**。
+
+**已于 2026-08-07 执行**（[#2527](https://github.com/SemiAnalysisAI/InferenceX/pull/2527)）：从启用的主配置中移除 17 个 `kimik2.5` 配置项，归档至 [`configs/deprecated/`](configs/deprecated/)，现分别合并至 `configs/deprecated/nvidia-master.yaml`（10 个）与 `configs/deprecated/amd-master.yaml`（7 个）。对应的 12 个基准测试脚本移入同级 `deprecated/` 目录。此后 `kimik2.5` 在所有主配置中**均无启用配置**，正式完全退役。同一 PR 还归档了 `kimik2.5-int4-h100-vllm`。#2493 将其脚本移入 `benchmarks/single_node/agentic/deprecated/` 时，该智能体编码配置项被遗留在 `nvidia-master.yaml` 中，现已与同类项一并归入 `configs/deprecated/nvidia-master.yaml`。SPEED-Bench 接受长度脚本 `benchmarks/single_node/speedbench/kimik2.5_fp4_b300_vllm.sh` 予以保留。Speedbench 由 `speedbench-al.yml` 驱动，不经过主配置，与 #2493 处理 MiniMax-M3 的方式一致。
+
+### 2026 年 9 月 8 日（星期二）
+
+**2026 年 9 月 8 日（星期二）**为 **DeepSeek-V4-Pro 1.6T**（`dsv4`）**单轮 8k1k** 场景的最后运行日，此后该场景对该模型弃用。**智能体编码不受影响，`dsv4` 的该场景继续启用**，其 MTP 与 DSpark 分支均予保留。该模型不会退役：智能体编码将成为其唯一场景，并继续运行与发布。
+
+| 模型 | 弃用内容 | 保留内容 |
+|---|---|---|
+| DeepSeek-V4-Pro 1.6T（`dsv4`） | 单轮 8k1k | 智能体编码，含 MTP 与 DSpark 分支 |
+
+原因：`dsv4` 是本仓库中单轮场景占用最大的模型。当前有 45 个启用的配置项使用 8k1k 场景（`configs/nvidia-master.yaml` 32 个，`configs/amd-master.yaml` 13 个），覆盖 H200、B200、B300、GB200、GB300、MI300X、MI325X 与 MI355X，涉及 vLLM、SGLang、TensorRT-LLM、ATOM、Dynamo 与 llm-d，在每一轮完整 sweep 中占比可观。AgentX 轨迹回放才是 AI 实验室与 ML 社区真正关注的场景，而 DeepSeek-V4-Pro 的 19 个智能体编码配置项正是 `dsv4` 中支撑已发布北极星（North Star）帕累托前沿的部分。下线固定序列长度分支可为 AgentX 以及 Qwen3.8-Flash-Next 等新前沿模型腾出集群机时，同时不减少该模型对外发布的内容。对于仍列有该场景的其他模型，单轮 8k1k 保持启用。
+
+**已于 2026-09-09 执行**（[#2921](https://github.com/SemiAnalysisAI/InferenceX/pull/2921)）：46 个 `dsv4` 8k1k 配置项已从启用的主配置中移除并归档至 [`configs/deprecated/`](configs/deprecated/)，现合并至 `configs/deprecated/nvidia-master.yaml`（33 个）与 `configs/deprecated/amd-master.yaml`（13 个）；对应的 28 个基准测试脚本移入同级 `deprecated/` 目录（`benchmarks/single_node/fixed_seq_len/` 下 25 个，`benchmarks/multi_node/` 下 3 个），与 [#2493](https://github.com/SemiAnalysisAI/InferenceX/pull/2493) 和 [#2527](https://github.com/SemiAnalysisAI/InferenceX/pull/2527) 的做法一致。数量为 46 而非上文所述的 45，是因为 `dsv4-fp4-b200-dynamo-sglang` 在本公告发布后才合入。19 个智能体编码配置项未做改动：`dsv4` 以智能体编码为唯一场景继续运行与发布。`dsv4` 的 SPEED-Bench 接受长度脚本予以保留。Speedbench 由 `speedbench-al.yml` 驱动，不经过主配置。已归档多节点配置项所引用的 srt-slurm 与 llm-d 配方 YAML 作为惰性参考数据原地保留，与 #2493 和 #2527 的处理一致。
+
+**弃用状态一致性核查（2026-09-21）：** 启用的主配置及基准测试脚本位置与上述已执行的退役事项和下方支持矩阵一致。GLM-5.1 B200 TileRT 仍是文档明确保留的例外，不受此前 GLM-5/5.1 和 1k1k 退役范围限制。有条件的 A/B 基线退役仍待执行；对 Pareto 前沿有贡献的非投机解码配置继续受支持。进一步的路由核查还移除了启动器和运行时设置中遗留的退役模型分支及 GLM-5 专用环境覆盖，并修正了仍推荐退役配置的工作流和智能体指南。SPEED-Bench 采集器、历史结果读取逻辑及明确保留的配方 YAML 继续保留。弃用配置现统一归档至 [`configs/deprecated/amd-master.yaml`](configs/deprecated/amd-master.yaml) 和 [`configs/deprecated/nvidia-master.yaml`](configs/deprecated/nvidia-master.yaml)。
 
 ## 场景
 
 | 场景 | ISL/OSL | 状态 |
 |---|---|---|
-| 智能体编码（agentic coding） | 长上下文、多轮真实流量的轨迹回放，含子智能体（sub agents） | 启用 — 基于轨迹回放的智能体编码基准测试（见 [`benchmarks/agentic/`](benchmarks/agentic/)）。今后新模型预计将仅以智能体编码场景接入，且**仅在启用投机解码的条件下**运行 —— 非投机解码分支不运行也不发布（见[弃用公告](#弃用公告)）。 |
-| 单轮 8k1k | 8192 / 1024 | 启用 — 当前主要的固定序列长度（fixed-seq-len）场景。 |
-| 单轮 1k1k | 1024 / 1024 | **对所有模型均已弃用**，自 2026-07-17 起（[#2263](https://github.com/SemiAnalysisAI/InferenceX/pull/2263)），以便将 GPU 集群时间留给优先级更高的真实场景智能体编码基准测试与新的前沿模型。归档配置位于 [`configs/deprecated/`](configs/deprecated/)。 |
+| 智能体编码（agentic coding） | 长上下文、多轮真实流量的轨迹回放，含子智能体（sub agents） | 启用。此场景采用基于轨迹回放的智能体编码基准测试（见 [`benchmarks/single_node/agentic/`](benchmarks/single_node/agentic/)）。今后新模型预计将仅以智能体编码场景接入。可开启或关闭投机解码以获得最优帕累托点；不要求独立的非投机解码 A/B 基线（见[弃用公告](#弃用公告)）。 |
+| 单轮 8k1k | 8192 / 1024 | 启用。当前主要的固定序列长度（fixed-seq-len）场景。 |
+| 单轮 1k1k | 1024 / 1024 | 自 2026-07-17 起弃用（[#2263](https://github.com/SemiAnalysisAI/InferenceX/pull/2263)），以便将 GPU 集群时间留给优先级更高的真实场景智能体编码基准测试与新的前沿模型。归档配置位于 [`configs/deprecated/`](configs/deprecated/)。后续由 [#2533](https://github.com/SemiAnalysisAI/InferenceX/pull/2533) 加入的 GLM-5.1 B200 TileRT 测试点仍启用。 |
 | 单轮 1k8k | 1024 / 8192 | **对所有模型均已弃用**，自 2026-03-27 起（[#911](https://github.com/SemiAnalysisAI/InferenceX/pull/911)），以便将 GPU 集群时间留给优先级更高的真实场景智能体编码基准测试与新的前沿模型。相关配置已删除，未归档。 |
 
 ## AgentX 指南
 
 ### 端到端归一化交互性与帕累托前沿策略
 
-端到端归一化交互性（E2E normalized interactivity）是 AgentX 轨迹回放结果的主要用户侧延迟指标，也是默认横轴。对于每个有效的性能分析请求 `i`，令 `OSL_i` 表示其正值输出序列长度，`E2EL_i` 表示其正值端到端延迟；E2EL 同时包含首 Token 延迟（TTFT）与生成时间。首先计算每个请求交付一个输出 Token 所需的时间：
+端到端归一化交互性（E2E normalized interactivity）是 AgentX 轨迹回放结果的主要用户侧延迟指标，也是默认横轴。对于每个有效的性能分析请求 `i`，令 `OSL_i` 表示其正值输出序列长度，`E2EL_i` 表示其正值端到端延迟。E2EL 同时包含首 Token 延迟（TTFT）与生成时间。首先计算每个请求交付一个输出 Token 所需的时间：
 
 `r_i = E2EL_i / OSL_i`（秒/输出 Token）
 
@@ -75,7 +93,7 @@ InferenceX-e2e 运行在数量固定且有限的 GPU 资源池上，并由一支
 
 ### 权衡与局限
 
-- 它不等同于常规解码交互性（`1 / TPOT`），因此两者的绝对值不能直接比较；由于计入 TTFT，端到端归一化交互性通常更低。
+- 它不等同于常规解码交互性（`1 / TPOT`），因此两者的绝对值不能直接比较。由于计入 TTFT，端到端归一化交互性通常更低。
 - TTFT 会按 OSL 摊薄，因此短输出受到的 TTFT 惩罚大于长输出。该指标仍与工作负载有关，只有使用相同轨迹分布和基准测试方法的结果才能比较。
 - 单一综合指标无法说明退化来自 TTFT 还是解码阶段。独立的端到端延迟、交互性和 TTFT 视图仍用于诊断。
 - 该指标依赖持久化的逐请求轨迹，并要求 E2EL 与 OSL 均为有效值。缺少这些轨迹的运行无法参与规范的帕累托前沿。
@@ -98,23 +116,24 @@ InferenceX-e2e 运行在数量固定且有限的 GPU 资源池上，并由一支
 该提交顺序指南有两项例外：
 
 1. 对于 MI455X UALoE72、VR200 NVL72、Rubin NVL8、TPUv8t、TPUv8i 等全新硬件 SKU，为实现初始支持，可先使用硬件专用引擎。预期相应的原生/上游 vLLM 或 SGLang 提交会在此后不久跟进。
-2. 对于新的模型架构，如果提供方无法将映射指定的原生/上游 vLLM 或 SGLang 引擎作为一级支持引擎，并能向核心维护者说明该框架尚不支持相应硬件—模型组合的根本性、第一性原理原因，则可先使用其他引擎。
+2. 对于新的模型架构，如果提供方无法将映射指定的原生/上游 vLLM 或 SGLang 引擎作为一级支持引擎，并能向核心维护者说明该框架尚不支持相应硬件与模型组合的根本性、第一性原理原因，则可先使用其他引擎。
 
-InferenceX 支持 SGLang 和 vLLM 双方的维护者，并响应 AI 实验室和机器学习社区希望看到两个框架性能数据的反馈。在仅指定一个主要框架的模型中，映射会将任务均衡分配给 vLLM 和 SGLang；同时指定两个框架的模型则提供共享覆盖。这确保 InferenceX 对两个框架进行同等测试，不偏向任何一方。
+InferenceX 支持 SGLang 和 vLLM 双方的维护者，并响应 AI 实验室和机器学习社区希望看到两个框架性能数据的反馈。在仅指定一个主要框架的模型中，映射会将任务均衡分配给 vLLM 和 SGLang。同时指定两个框架的模型则提供共享覆盖。这确保 InferenceX 对两个框架进行同等测试，不偏向任何一方。
 
 表中还同时记录已达成一致的草稿模型规划（PoR）以及尚待合作伙伴对齐的提案。
 
 | 模型 | 首选原生/上游引擎 | 已达成一致的草稿模型（PoR） | 待合作伙伴对齐的草稿模型提案 | 其他引擎 |
 |---|---|---|---|---|
-| DeepSeek-V4-Pro 1.6T（`dsv4`） | 原生/上游 vLLM 引擎和原生/上游 SGLang 引擎 | 原生 MTP | `deepseek-ai/DeepSeek-V4-Pro-DSpark` —— 仅提议用于 AgentX，并须遵循相同的合成接受方法；尚待合作伙伴对齐。单轮 8k1k 继续使用原生 MTP 头。 | 按照上述提交顺序指南及例外处理的其他非 vLLM/SGLang 引擎 |
-| Kimi-K3（`kimik3`） | 原生/上游 vLLM 引擎 | `Inferact/Kimi-K3-DSpark` | — | 按照上述提交顺序指南及例外处理的其他非 vLLM/SGLang 引擎 |
-| MiniMax-M3（`minimaxm3`） | 原生/上游 vLLM 引擎 | `Inferact/MiniMax-M3-EAGLE3` 和/或 `Inferact/MiniMax-M3-EAGLE3-GQA` | — | 按照上述提交顺序指南及例外处理的其他非 vLLM/SGLang 引擎 |
-| GLM-5.2（`glm5.2`） | 原生/上游 SGLang 引擎 | 原生 MTP | — | 按照上述提交顺序指南及例外处理的其他非 vLLM/SGLang 引擎 |
-| Qwen3.5-397B-A17B（`qwen3.5`） | 原生/上游 SGLang 引擎 | 原生 MTP | — | 按照上述提交顺序指南及例外处理的其他非 vLLM/SGLang 引擎 |
+| DeepSeek-V4-Pro 1.6T（`dsv4`） | 原生/上游 vLLM 引擎和原生/上游 SGLang 引擎 | 原生 MTP（智能体编码 MTP 分支；此前亦用于单轮 8k1k，已于 2026-09-09 退役）；`deepseek-ai/DeepSeek-V4-Pro-0813`（仅用于智能体编码，遵循与 Kimi-K3 DSpark PoR 相同的合成接受方法） | 无 | 按照上述提交顺序指南及例外处理的其他非 vLLM/SGLang 引擎 |
+| Kimi-K3（`kimik3`） | 原生/上游 vLLM 引擎 | `Inferact/Kimi-K3-DSpark` | 无 | 按照上述提交顺序指南及例外处理的其他非 vLLM/SGLang 引擎 |
+| MiniMax-M3（`minimaxm3`） | 原生/上游 vLLM 引擎 | `Inferact/MiniMax-M3-EAGLE3` 和/或 `Inferact/MiniMax-M3-EAGLE3-GQA` | 无 | 按照上述提交顺序指南及例外处理的其他非 vLLM/SGLang 引擎 |
+| GLM-5.2（`glm5.2`） | 原生/上游 SGLang 引擎 | 原生 MTP | 无 | 按照上述提交顺序指南及例外处理的其他非 vLLM/SGLang 引擎 |
+| Qwen3.5-397B-A17B（`qwen3.5`） | 原生/上游 SGLang 引擎 | 原生 MTP | 无 | 按照上述提交顺序指南及例外处理的其他非 vLLM/SGLang 引擎 |
+| Qwen3.8-Flash-Next（`qwen3.8next`） | 原生/上游 SGLang 引擎 | 待定 | 原生 MTP（内置 4B 多步预测模块；黄金 AL 采集脚本：[`qwen3.8next_fp4_b300_vllm.sh`](benchmarks/single_node/speedbench/qwen3.8next_fp4_b300_vllm.sh)） | 按照上述提交顺序指南及例外处理的其他非 vLLM/SGLang 引擎 |
 
 ### KV 缓存卸载策略
 
-为遵循“通过限制范围实现快速交付”的设计原则，AgentX 初始策略仅允许 CPU DRAM KV 缓存卸载，且该功能为可选项。支持的方案包括 vLLM Connector、LMCache、SGLang HiCache、Mooncake CPU DRAM Connector、Dynamo KVBM、CPU DRAM P2P 池化以及类似的 CPU 内存机制。供应商可自行决定是否为每项提交启用 CPU KV 缓存卸载；如果禁用后能得到更优的 Pareto 点，也可选择禁用。
+为遵循“通过限制范围实现快速交付”的设计原则，AgentX 初始策略仅允许 CPU DRAM KV 缓存卸载，且该功能为可选项。支持的方案包括 vLLM Connector、LMCache、SGLang HiCache、Mooncake CPU DRAM Connector、Dynamo KVBM、CPU DRAM P2P 池化以及类似的 CPU 内存机制。供应商可自行决定是否为每项提交启用 CPU KV 缓存卸载。如果禁用后能得到更优的 Pareto 点，也可选择禁用。
 
 用于 KV 缓存卸载的 CPU DDR5 容量必须与推理配置实际使用的服务器 GPU 比例成正比：
 
@@ -135,20 +154,22 @@ InferenceX 支持 SGLang 和 vLLM 双方的维护者，并响应 AI 实验室和
 
 | 模型架构类别 | 前缀 | 加入日期 | 启用场景 | 已弃用场景 |
 |---|---|---|---|---|
-| Qwen3.8 2.4T | `qwen3.8` | 待定 | 智能体编码 | |
-| Kimi-K3 | `kimik3` | 2026-07-27 ([#2391](https://github.com/SemiAnalysisAI/InferenceX/pull/2391)) | 智能体编码（仅 DSpark） | 智能体编码非 DSpark 分支（自第 0 天起弃用） |
-| GLM-5.2 | `glm5.2` | 2026-07-18（[#2268](https://github.com/SemiAnalysisAI/InferenceX/pull/2268)） | 智能体编码（「仅 MTP」待执行 —— 非 MTP 分支仍在运行，见弃用公告） | |
+| DeepSeek-V4.1-Flash | `dsv41flash` | 2026-09-10 | 智能体编码（DSpark、Engram UVA 卸载；GPU 待验证） | |
+| Qwen3.8-Flash-Next | `qwen3.8next` | 2026-08-26（[#2742](https://github.com/SemiAnalysisAI/InferenceX/pull/2742)） | 智能体编码 | |
+| Kimi-K3 | `kimik3` | 2026-07-27 ([#2391](https://github.com/SemiAnalysisAI/InferenceX/pull/2391)) | 智能体编码（可关闭 DSpark 以获得更优帕累托点） | 独立非 DSpark A/B 基线（自第 0 天起即不要求） |
+| GLM-5.2 | `glm5.2` | 2026-07-18（[#2268](https://github.com/SemiAnalysisAI/InferenceX/pull/2268)） | 智能体编码（非 MTP 数据点仍可按帕累托策略参与发布；见弃用公告） | |
 | MiniMax-M3 | `minimaxm3` | 2026-06-12（[#1724](https://github.com/SemiAnalysisAI/InferenceX/pull/1724)） | 智能体编码 | 单轮 1k1k、单轮 8k1k（2026-08-04 移除，[#2493](https://github.com/SemiAnalysisAI/InferenceX/pull/2493)） |
-| DeepSeek-V4-Pro | `dsv4` | 2026-04-24（[#1130](https://github.com/SemiAnalysisAI/InferenceX/pull/1130)） | 单轮 8k1k、智能体编码（「仅 MTP」待执行 —— 非 MTP 分支仍在运行，见弃用公告） | 单轮 1k1k |
-| GLM-5 / GLM-5.1 | `glm5`、`glm5.1` | 2026-03-06（[#762](https://github.com/SemiAnalysisAI/InferenceX/pull/762)）；GLM-5.1 于 2026-04-21 加入（[#1098](https://github.com/SemiAnalysisAI/InferenceX/pull/1098)） | —（2026-07-18 退役，[#2276](https://github.com/SemiAnalysisAI/InferenceX/pull/2276)） | 单轮 1k1k、单轮 1k8k（仅 GLM-5）、单轮 8k1k |
-| MiniMax-M2.5/2.7 | `minimaxm2.5` | 2026-02-18（[#755](https://github.com/SemiAnalysisAI/InferenceX/pull/755)） | —（2026-06-20 退役，[#1874](https://github.com/SemiAnalysisAI/InferenceX/pull/1874)） | 单轮 1k1k、单轮 1k8k、单轮 8k1k |
-| Kimi-K2.5/2.6/2.7-Code | `kimik2.5` | 2026-02-17（[#734](https://github.com/SemiAnalysisAI/InferenceX/pull/734)） | 单轮 8k1k（至 2026-08-06）—— 2026-08-06 后完全退役 | 单轮 1k1k、单轮 1k8k、智能体编码（2026-08-04 移除，[#2493](https://github.com/SemiAnalysisAI/InferenceX/pull/2493)） |
-| Qwen3.5-397B-A17B | `qwen3.5` | 2026-02-16（[#704](https://github.com/SemiAnalysisAI/InferenceX/pull/704)） | 单轮 8k1k、智能体编码；仅 fp8/fp4 | 单轮 1k1k、单轮 1k8k、全部 bf16 配方（2026-08-04 移除，[#2493](https://github.com/SemiAnalysisAI/InferenceX/pull/2493)） |
-| gpt-oss-120b | `gptoss` | 2025-09-09 | —（2026-07-06 退役，[#2101](https://github.com/SemiAnalysisAI/InferenceX/pull/2101)） | 单轮 1k1k、单轮 1k8k、单轮 8k1k |
+| DeepSeek-V4.1-Flash | `dsv41flash` | 待验证 | MI355X 上的 Agentic coding（草案；等待 GPU 验证） | — |
+| DeepSeek-V4-Pro | `dsv4` | 2026-04-24（[#1130](https://github.com/SemiAnalysisAI/InferenceX/pull/1130)） | 智能体编码（非投机解码数据点仍可按帕累托策略参与发布） | 单轮 1k1k、单轮 8k1k（已于 2026-09-09 移除，[#2921](https://github.com/SemiAnalysisAI/InferenceX/pull/2921)） |
+| GLM-5 / GLM-5.1 | `glm5`、`glm5.1` | 2026-03-06（[#762](https://github.com/SemiAnalysisAI/InferenceX/pull/762)），GLM-5.1 于 2026-04-21 加入（[#1098](https://github.com/SemiAnalysisAI/InferenceX/pull/1098)） | 仅 GLM-5.1 B200 TileRT：1k1k 和 8k1k 于 2026-08-09 加入（[#2533](https://github.com/SemiAnalysisAI/InferenceX/pull/2533)）；智能体编码由 [#2650](https://github.com/SemiAnalysisAI/InferenceX/pull/2650) 加入 | 此前的 GLM-5 / GLM-5.1 配方于 2026-07-18 退役（[#2276](https://github.com/SemiAnalysisAI/InferenceX/pull/2276)） |
+| MiniMax-M2.5/2.7 | `minimaxm2.5` | 2026-02-18（[#755](https://github.com/SemiAnalysisAI/InferenceX/pull/755)） | 无（2026-06-20 退役，[#1874](https://github.com/SemiAnalysisAI/InferenceX/pull/1874)） | 单轮 1k1k、单轮 1k8k、单轮 8k1k |
+| Kimi-K2.5/2.6/2.7-Code | `kimik2.5` | 2026-02-17（[#734](https://github.com/SemiAnalysisAI/InferenceX/pull/734)） | 无（2026-08-07 完全退役，[#2527](https://github.com/SemiAnalysisAI/InferenceX/pull/2527)） | 单轮 1k1k、单轮 1k8k、智能体编码（2026-08-04 移除，[#2493](https://github.com/SemiAnalysisAI/InferenceX/pull/2493)）、单轮 8k1k（2026-08-07 移除，[#2527](https://github.com/SemiAnalysisAI/InferenceX/pull/2527)） |
+| Qwen3.5-397B-A17B | `qwen3.5` | 2026-02-16（[#704](https://github.com/SemiAnalysisAI/InferenceX/pull/704)） | 单轮 8k1k 与智能体编码，二者均仅限 fp8/fp4 | 单轮 1k1k、单轮 1k8k、全部 bf16 配方（2026-08-04 移除，[#2493](https://github.com/SemiAnalysisAI/InferenceX/pull/2493)） |
+| gpt-oss-120b | `gptoss` | 2025-09-09 | 无（2026-07-06 退役，[#2101](https://github.com/SemiAnalysisAI/InferenceX/pull/2101)） | 单轮 1k1k、单轮 1k8k、单轮 8k1k |
 | DeepSeek-R1-0528 | `dsr1` | 2025-08-13 | 单轮 8k1k | 单轮 1k1k、单轮 1k8k |
-| Llama-3.1-70B-Instruct | `llama70b` | 2025-08-12 | —（2025-10-29 退役，[#149](https://github.com/SemiAnalysisAI/InferenceX/pull/149)） | 单轮 1k1k、单轮 1k8k、单轮 8k1k [^1] |
+| Llama-3.1-70B-Instruct | `llama70b` | 2025-08-12 | 无（2025-10-29 退役，[#149](https://github.com/SemiAnalysisAI/InferenceX/pull/149)） | 单轮 1k1k、单轮 1k8k、单轮 8k1k [^1] |
 
-[^1]: `llama70b` 早于 master 配置体系；退役时其配置被直接删除，未归档到 `configs/deprecated/`。该模型最初以 workflow 模板形式随仓库首次导入（2025-08-12）。
+[^1]: `llama70b` 早于 master 配置体系。退役时其配置被直接删除，未归档到 `configs/deprecated/`。该模型最初以 workflow 模板形式随仓库首次导入（2025-08-12）。
 
 ## 说明
 
@@ -156,4 +177,4 @@ InferenceX 支持 SGLang 和 vLLM 双方的维护者，并响应 AI 实验室和
 - 「退役」指该模型已无任何启用场景。退役模型的配置（`llama70b` 除外）归档于 [`configs/deprecated/`](configs/deprecated/)。
 - 弃用某一精度（如 Qwen3.5 bf16）或 A/B 对照中的某一分支（如非 MTP），只是收窄该模型的配方覆盖范围，并不等于模型退役；只要仍有一个场景在运行，该模型即继续列为启用状态。
 - `dsr1` 最初以 DeepSeek-V3 workflow 模板的形式随仓库首次导入，2025-08-13 切换为 DeepSeek-R1 基准测试（2025-08-20 将 `dsv3` 重命名为 `dsr1`）。
-- 新增模型时，请按 [`AGENTS.md`](AGENTS.md) 中「Adding a benchmark configuration」的流程操作，并在同一 PR 中同时更新本文件与 [`MODELS.md`](MODELS.md) 的表格。
+- 新增模型时，请按[添加模型 + 硬件配方](docs/configuration-procedures_zh.md#添加模型--硬件配方)流程操作，并在同一 PR 中同时更新本文件与 [`MODELS.md`](MODELS.md) 的表格。
