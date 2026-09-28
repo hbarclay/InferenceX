@@ -1,0 +1,8 @@
+[nvidia.vllm]
+image = "vllm/vllm-openai:nightly-cd10ed6f9f6b37a8ace9cf380007e66fe12ec0c3"
+
+[amd.torch]
+image = "vllm/vllm-openai-rocm:v0.19.0"
+
+[amd.vllm]
+image = "vllm/vllm-openai-rocm:nightly-rocm100-3df4ae153eb385e27b52f26c81f8edb9e20b9984"

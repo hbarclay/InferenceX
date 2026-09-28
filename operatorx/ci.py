@@ -1,0 +1,895 @@
+"""CPU-only planning and Slurm execution for the OperatorX Actions workflow."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import platform
+import pwd
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from collections import defaultdict
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+# Each shard runs on the self-hosted runners that carry this label - the labels
+# InferenceX's benchmark workflows request - mapped to its Slurm cluster id and the
+# CollectiveX platform profile (configs/platform_config.json) its Slurm settings come from.
+RUNNERS = {
+    "cluster:h100-dgxc": ("h100_dgxc_8x", "h100-dgxc"),
+    "cluster:h200-dgxc": ("h200_dgxc_8x", "h200-dgxc"),
+    "cluster:b200-nscale": ("b200_nscale_8x", "b200-nscale"),
+    "cluster:b300-dsxe": ("b300_dsxe_8x", "b300"),
+    "cluster:gb200-nv": ("gb200_nvl72_4x", "gb200"),
+    "cluster:gb300-nv": ("gb300_nvl72_4x", "gb300"),
+    "cluster:mi300x-amd": ("mi300x_amds_8x", "mi300x"),
+    "cluster:mi325x-amds": ("mi325x_amds_8x", "mi325x"),
+    "cluster:mi355x-amds": ("mi355x_8x", "mi355x"),
+}
+MODES = ("timing", "counters")
+# Hardware counters per kernel. Latencies from a counters run are perturbed by the profiler.
+NCU_METRICS = ",".join((
+    "gpu__time_duration.sum", "sm__cycles_elapsed.avg.per_second",
+    "gpc__cycles_elapsed.avg.per_second", "dram__cycles_elapsed.avg.per_second",
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+    "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed",
+    "sm__warps_active.avg.pct_of_peak_sustained_active",
+    "sm__cycles_active.sum", "sm__cycles_active.avg", "sm__cycles_active.min",
+    "sm__cycles_active.max", "dram__bytes_read.sum", "dram__bytes_read.avg",
+    "dram__bytes_read.min", "dram__bytes_read.max", "dram__bytes_write.sum",
+    "lts__t_sectors.sum", "lts__t_sectors.avg", "lts__t_sectors.min", "lts__t_sectors.max",
+    "lts__t_sector_hit_rate.pct", "lts__t_sectors_lookup_hit.sum",
+    "lts__t_sectors_lookup_miss.sum", "lts__t_sectors_op_read.sum",
+    "lts__t_sectors_op_write.sum", "lts__t_sectors_op_atom.sum", "lts__t_sectors_op_red.sum",
+    "lts__t_sectors_aperture_sysmem_op_read.sum", "lts__t_sectors_aperture_sysmem_op_write.sum",
+    "l1tex__t_sector_hit_rate.pct", "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
+    "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum",
+    "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum",
+    "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum",
+    "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum",
+    "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum",
+))
+# Host Nsight Compute: real installs (<root>/nsight-compute[-]<version>/ncu), then any ncu on PATH.
+NCU_SEARCH = (
+    "ls -d /opt/nvidia/nsight-compute/*/ncu /usr/local/cuda*/nsight-compute*/ncu "
+    "/opt/nvidia/nsight-compute*/ncu $(command -v ncu) 2>/dev/null | xargs -r readlink -f | sort -u"
+)
+
+
+def pick_ncu(paths: list[str]) -> Path | None:
+    """Newest real Nsight Compute install; a PATH wrapper (e.g. cuda/bin/ncu) only as a fallback."""
+    def version(p: Path) -> tuple:
+        name = p.parent.name.removeprefix("nsight-compute").lstrip("-")
+        return tuple(int(x) for x in re.findall(r"\d+", name))
+    real = [Path(p) for p in paths if "nsight-compute" in Path(p).parent.as_posix()]
+    if real:
+        return max(real, key=version)
+    return Path(paths[-1]) if paths else None
+# rocprofv3 fits only a few counters per hardware pass, so a counters run repeats per pass.
+ROCPROF_PASSES = {
+    "fetch": ["FETCH_SIZE"],
+    "hm": ["TCC_HIT_sum", "TCC_MISS_sum"],
+    "rdhist": ["TCC_EA0_RDREQ_128B_sum", "TCC_EA0_RDREQ_32B_sum", "TCC_EA0_RDREQ_64B_sum",
+               "TCC_EA0_RDREQ_sum"],
+    "sqcomp": ["SQ_BUSY_CYCLES", "SQ_INSTS_MFMA", "SQ_INSTS_VALU", "SQ_VALU_MFMA_BUSY_CYCLES",
+               "SQ_WAVES", "SQ_WAVE_CYCLES"],
+    "sqmem": ["SQ_INSTS_LDS_LOAD", "SQ_INSTS_LDS_STORE", "SQ_INSTS_SMEM", "SQ_INSTS_VMEM_RD",
+              "SQ_INSTS_VMEM_WR", "SQ_LDS_BANK_CONFLICT"],
+    "stalls": ["TCC_BUBBLE_sum", "TCC_EA0_RDREQ_DRAM_CREDIT_STALL_sum",
+               "TCC_EA0_WRREQ_DRAM_CREDIT_STALL_sum"],
+    "tccops": ["TCC_ATOMIC_sum", "TCC_READ_sum", "TCC_REQ_sum", "TCC_WRITE_sum"],
+    "tcp": ["TCP_TAGRAM0_REQ_sum", "TCP_TOTAL_CACHE_ACCESSES_sum", "TCP_TOTAL_READ_sum",
+            "TCP_TOTAL_WRITE_sum"],
+    "util": ["LdsUtil", "MemUnitStalled", "SALUBusy", "VALUBusy", "VALUUtilization"],
+    "util2": ["GPU_UTIL", "SQC_DCACHE_HITS", "SQC_ICACHE_HITS", "TD_TD_BUSY_sum"],
+    "wom": ["GRBM_GUI_ACTIVE", "MfmaUtil", "OccupancyPercent", "WRITE_SIZE"],
+    "wrdst": ["TCC_EA0_RDREQ_DRAM_sum", "TCC_EA0_WRREQ_64B_sum", "TCC_EA0_WRREQ_DRAM_sum",
+              "TCC_EA0_WRREQ_sum"],
+}
+
+
+def load_platforms(path: Path) -> dict:
+    """Hardware and Slurm settings per runner label: the CollectiveX profile the label
+    maps to, overlaid with this file's own entry for the label."""
+    document = json.loads(path.read_text())
+    base = {}
+    if "base" in document:
+        base = json.loads((path.parent / document["base"]).read_text())["platforms"]
+    platforms = {}
+    for runner, (_, profile) in RUNNERS.items():
+        merged = {**base.get(profile, {}), **document["platforms"].get(runner, {})}
+        if merged:
+            platforms[runner] = merged
+    return platforms
+
+
+def family(name: str) -> str:
+    """Hardware family of a runner label: 'cluster:mi355x-amds' -> 'mi355x'."""
+    return name.removeprefix("cluster:").split("-")[0]
+
+
+def is_amd(runner: str) -> bool:
+    return family(runner).startswith("mi")
+
+
+def write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def plan(
+    runner: str,
+    backends: list[str],
+    testlists: dict[str, list[dict]],
+    images: dict[str, dict],
+    world_sizes: list[int],
+    chunk_size: int,
+    platforms: dict[str, dict],
+    mode: str = "timing",
+    find_recipe=None,
+) -> dict:
+    """Shards for a selection. A case whose source checkpoint InferenceX serves on this
+    hardware runs under that recipe (find_recipe(framework, hardware, checkpoints),
+    operatorx.recipes.find): its image, launch env and server arguments."""
+    from operatorx.recipes import FRAMEWORKS, checkpoints
+    if runner not in RUNNERS:
+        raise ValueError(f"unsupported runner: {runner}")
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {', '.join(MODES)}")
+    hardware = platforms[runner]
+    gpus = hardware["gpus_per_node"]
+    image_platform = hardware["image_platform"]
+    if type(gpus) is not int or gpus not in (4, 8):
+        raise ValueError("runner must supply four or eight GPUs per physical node")
+    if image_platform not in ("linux/amd64", "linux/arm64"):
+        raise ValueError("unsupported image platform")
+    if not backends or set(backends) - images.keys():
+        raise ValueError("select at least one registered backend for this GPU platform")
+    if is_amd(runner) and (
+        set(backends) - {"torch", "vllm"}
+        or world_sizes != [1]
+        or any(
+            shape["type"] not in {"gemm", "moe", "mla", "mla_dsa", "dsv4_attn", "gqa", "qsa", "gdn", "kda"}
+            for shapes in testlists.values()
+            for shape in shapes
+        )
+    ):
+        raise ValueError(
+            "AMD CI supports single-GPU torch/vllm GEMM"
+        )
+    if not world_sizes or set(world_sizes) - {1, 2, 4, 8}:
+        raise ValueError("world sizes must be selected from 1,2,4,8 (single node)")
+    if any(ws > gpus for ws in world_sizes):
+        raise ValueError(f"world size exceeds the runner's {gpus}-GPU physical node")
+    if not 1 <= chunk_size <= 500:
+        raise ValueError("chunk size must be between 1 and 500")
+    groups = defaultdict(list)
+    recipes_seen: dict[str, dict] = {}
+    excluded = 0
+    for name, shapes in sorted(testlists.items()):
+        for shape in shapes:
+            args = shape["args"]
+            ws = args.get("world_size", 1)
+            if type(ws) is not int or ws < 1:
+                raise ValueError("world_size must be a positive integer")
+            if ws not in world_sizes:
+                excluded += 1
+                continue
+            recipe = next((r for b in backends if b in FRAMEWORKS and find_recipe
+                           for r in [find_recipe(b, family(runner), checkpoints(shape.get("sources")))] if r),
+                          None)
+            if recipe:
+                recipes_seen[recipe["recipe"]] = recipe
+            groups[(ws, recipe["recipe"] if recipe else "")].append({"testlist": name, "shape": shape})
+    image_groups = defaultdict(list)
+    for backend in sorted(set(backends)):
+        image_groups[images[backend]["image"]].append(backend)
+    cells = []
+    shards = []
+    for (ws, recipe), cases in sorted(groups.items()):
+        rest = image_groups
+        if recipe:
+            r = recipes_seen[recipe]
+            framework = next(b for b in backends if b in FRAMEWORKS)
+            shards.append((r["image"], [framework], ws, cases,
+                           {"recipe": recipe, "checkpoint": r["checkpoint"], "env": r["env"],
+                            "engine_args": r["engine_args"]}))
+            # the other backends run the same cases on their own images
+            rest = {i: [b for b in bs if b != framework] for i, bs in image_groups.items()}
+        shards += [(image, selected, ws, cases, {}) for image, selected in sorted(rest.items()) if selected]
+    for image, selected, ws, cases, extra in shards:
+            for offset in range(0, len(cases), chunk_size):
+                cell = {
+                    "runner": runner,
+                    "cluster": RUNNERS[runner][0],
+                    "nodes": 1,
+                    "gpus_per_node": gpus,
+                    "image_platform": image_platform,
+                    "world_size": ws,
+                    "image": image,
+                    "mode": mode,
+                    "backends": selected,
+                    "offset": offset,
+                    "cases": cases[offset : offset + chunk_size],
+                    **extra,
+                }
+                identity = hashlib.sha256(
+                    json.dumps(cell, sort_keys=True).encode()
+                ).hexdigest()[:16]
+                cells.append({"id": f"{runner.removeprefix('cluster:')}-{identity}", **cell})
+    if not cells:
+        raise ValueError("selection contains no runnable shapes")
+    if len(cells) > 256:
+        raise ValueError(
+            "selection exceeds 256 shards; narrow the testlists/backends/world sizes"
+        )
+    return {"version": 1, "excluded_shapes": excluded, "include": cells}
+
+
+def probe_module():
+    path = ROOT.parent / "collectivex/runtime/probe.py"
+    spec = importlib.util.spec_from_file_location("collectivex_probe", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def command(argv: list[str], log: Path, *, env=None) -> None:
+    print(f"[operatorx] phase={log.stem}", flush=True)
+    with log.open("a") as stream:
+        process = subprocess.Popen(
+            argv, stdout=stream, stderr=subprocess.STDOUT, env=env
+        )
+        try:
+            rc = process.wait()
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        if rc:
+            print(log.read_text()[-16000:], file=sys.stderr)
+            raise subprocess.CalledProcessError(rc, argv)
+
+
+def allocation_ids(root: Path) -> list[str]:
+    log = root / "allocation.log"
+    if not log.exists():
+        return []
+    return sorted(
+        set(re.findall(r"(?:Granted|Pending) job allocation ([0-9]+)", log.read_text()))
+    )
+
+
+def cleanup(root: Path, timeout_seconds: int) -> None:
+    if timeout_seconds <= 0:
+        raise ValueError("cleanup timeout must be positive")
+    for job in allocation_ids(root):
+        subprocess.run(["scancel", job], check=False, timeout=15)
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            state = subprocess.run(
+                ["squeue", "-h", "-u", str(os.getuid()), "-o", "%A"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            with (root / "cleanup.log").open("a") as log:
+                log.write(
+                    f"job={job} rc={state.returncode} active={state.stdout!r} "
+                    f"error={state.stderr!r}\n"
+                )
+            if state.returncode == 0 and job not in state.stdout.split():
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError(
+                f"allocation {job} did not terminate; retaining staged evidence"
+            )
+
+
+def image_key(image: str, digest: str, image_platform: str) -> str:
+    # Preserve the already-qualified amd64 cache while isolating Arm imports.
+    suffix = "" if image_platform == "linux/amd64" else f":{image_platform}"
+    return hashlib.sha256((image + digest + suffix).encode()).hexdigest()
+
+
+def shared_base(profile: dict, runner: str) -> Path:
+    """Resolve the runner's configured/shared account storage, never temporary HOME."""
+    if profile.get("stage_dir"):
+        roots = [Path(profile["stage_dir"])]
+    elif is_amd(runner):
+        runner_temp = Path(os.environ["RUNNER_TEMP"])
+        if (
+            runner_temp.parts[-2:] != ("_work", "_temp")
+            or not runner_temp.is_absolute()
+        ):
+            raise ValueError("AMD staging requires the shared runner _work/_temp path")
+        roots = [runner_temp.parent.parent]
+    elif family(runner) == "b300":
+        # CollectiveX uses the compute-visible account home on these nodes.
+        # The shared squash parent is not writable by the GHA service account.
+        roots = [Path(pwd.getpwuid(os.getuid()).pw_dir)]
+    elif profile.get("squash_dir"):
+        roots = [Path(profile["squash_dir"]).parent]
+    else:
+        roots = [Path(root) for root in profile["storage_roots"]]
+    for root in roots:
+        if root.is_dir() and os.access(root, os.W_OK | os.X_OK):
+            return root / f".operatorx-{os.getuid()}"
+    raise ValueError("no writable shared storage root configured for this runner")
+
+
+def import_image(args) -> None:
+    # Runs on the configured import host with a compute-visible cache and lock.
+    import fcntl
+
+    image, digest = args.image, args.digest
+    machines = {"linux/amd64": {"x86_64", "amd64"}, "linux/arm64": {"aarch64", "arm64"}}
+    if platform.machine() not in machines[args.image_platform]:
+        raise ValueError("image platform does not match the import host")
+    args.cache.mkdir(parents=True, exist_ok=True)
+    key = image_key(image, digest, args.image_platform)
+    squash = args.cache / f"{key}.sqsh"
+    with (args.cache / f"{key}.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if (
+            squash.exists()
+            and subprocess.run(
+                ["unsquashfs", "-s", str(squash)],
+                stdout=subprocess.DEVNULL,
+                check=False,
+            ).returncode
+            == 0
+        ):
+            return
+        temporary = squash.with_suffix(".partial")
+        temporary.unlink(missing_ok=True)
+        try:
+            host, repository, tag = probe_module().registry_reference(image)
+            uri = f"docker://{host}#{repository}:{tag}"
+            # B300 login/compute homes are node-local; every importer gets private
+            # temporary paths. Preserve an explicitly configured shared cache. Where
+            # /tmp cannot hold overlay whiteouts (H100 DGXC) the node's own enroot
+            # paths are kept, as its InferenceX launcher imports with them.
+            with tempfile.TemporaryDirectory(prefix="operatorx-enroot-") as scratch:
+                env = dict(os.environ)
+                private = os.environ.get("OPERATORX_ENROOT_DEFAULTS") != "1"
+                if private:
+                    env["TMPDIR"] = scratch
+                for name in ("TEMP", "DATA", "RUNTIME") if private else ():
+                    directory = Path(scratch) / name.lower()
+                    directory.mkdir()
+                    env[f"ENROOT_{name}_PATH"] = str(directory)
+                if private and "ENROOT_CACHE_PATH" not in env:
+                    cache = Path(scratch) / "cache"
+                    cache.mkdir()
+                    env["ENROOT_CACHE_PATH"] = str(cache)
+                subprocess.run(
+                    ["enroot", "import", "-o", str(temporary), uri],
+                    stdin=subprocess.DEVNULL,
+                    check=True,
+                    env=env,
+                )
+            subprocess.run(["unsquashfs", "-s", str(temporary)], check=True)
+            # The importer uses the tag, just like CollectiveX. Refuse a tag that moved
+            # between planning and import rather than mislabelling the measurement.
+            if probe_module().resolve_image_digest(image) != digest:
+                raise RuntimeError(
+                    "image tag moved or digest verification failed; dispatch again"
+                )
+            temporary.replace(squash)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def finalize(root: Path, cleanup_seconds: int) -> None:
+    if not root.exists():
+        return
+    cleanup(root, cleanup_seconds)
+    execution = root / "execution.json"
+    if execution.exists():
+        data = json.loads(execution.read_text())
+        stage = Path(data["stage"])
+        expected_parent = f".operatorx-{os.getuid()}"
+        if (
+            stage.parent.name != expected_parent
+            or not stage.name.startswith(
+                f"{data['run_id']}-{data['attempt']}-{data['cell']['id']}-"
+            )
+            or stage.is_symlink()
+        ):
+            raise ValueError("refusing unsafe stage cleanup")
+        if (stage / "results").exists():
+            shutil.copytree(stage / "results", root / "results", dirs_exist_ok=True)
+        if stage.exists():
+            shutil.rmtree(stage)
+
+
+def recover(
+    artifacts: Path, run_id: str, runner: str, platform_config: Path, cleanup_seconds: int
+) -> None:
+    profile = load_platforms(platform_config)[runner]["operator"]
+    base = shared_base(profile, runner).resolve()
+    recovered = 0
+    for execution in artifacts.rglob("execution.json"):
+        data = json.loads(execution.read_text())
+        if data["run_id"] != run_id or data["cell"]["runner"] != runner:
+            raise ValueError("recovery artifact does not match requested run/runner")
+        stage = Path(data["stage"])
+        if stage.parent.resolve() != base:
+            raise ValueError("recovery stage does not belong to this runner/user")
+        finalize(execution.parent, cleanup_seconds)
+        recovered += 1
+    if not recovered:
+        raise ValueError("no execution artifacts found to recover")
+    print(f"Recovered {recovered} execution(s) from run {run_id}", flush=True)
+
+
+def execute(args) -> None:
+    root = args.output.resolve()
+    root.mkdir(parents=True, exist_ok=False, mode=0o700)
+    manifest = json.loads(args.manifest.read_text())
+    if manifest["source_sha"] != args.source_sha or manifest["run_id"] != args.run_id:
+        raise ValueError("manifest source/run mismatch")
+    cells = manifest["include"]
+    cell = next(c for c in cells if c["id"] == args.shard)
+    hardware = load_platforms(args.platform_config)[cell["runner"]]
+    profile = hardware["operator"]
+    gpus = hardware["gpus_per_node"]
+    image_platform = hardware["image_platform"]
+    if (
+        cell["gpus_per_node"] != gpus
+        or cell["image_platform"] != image_platform
+        or cell["world_size"] > gpus
+    ):
+        raise ValueError("manifest hardware differs from the selected runner")
+    base = shared_base(profile, cell["runner"])
+    base.mkdir(mode=0o700, exist_ok=True)
+    if (
+        base.is_symlink()
+        or base.stat().st_uid != os.getuid()
+        or base.stat().st_mode & 0o077
+    ):
+        raise RuntimeError("unsafe shared OperatorX stage directory")
+    stage = Path(
+        tempfile.mkdtemp(prefix=f"{args.run_id}-{args.attempt}-{cell['id']}-", dir=base)
+    )
+    write_json(
+        root / "execution.json",
+        {
+            "cell": cell,
+            "source_sha": args.source_sha,
+            "run_id": args.run_id,
+            "attempt": args.attempt,
+            "stage": str(stage),
+        },
+    )
+
+    def interrupted(signum, frame):
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, interrupted)
+    rc = 1
+    try:
+        shutil.copytree(
+            ROOT,
+            stage / "source/operatorx",
+            ignore=shutil.ignore_patterns("__pycache__", "results", ".venv", "tests"),
+        )
+        shutil.copytree(
+            ROOT.parent / "collectivex/runtime",
+            stage / "source/collectivex/runtime",
+        )
+        for name in sorted({c["testlist"] for c in cell["cases"]}):
+            write_json(
+                stage / "testlists" / f"{name}.json",
+                [c["shape"] for c in cell["cases"] if c["testlist"] == name],
+            )
+        (stage / "results").mkdir()
+        allocation = [
+            "salloc",
+            "--no-shell",
+            f"--partition={profile['partition']}",
+            "--nodes=1",
+            f"--gres=gpu:{gpus}",
+            f"--ntasks-per-node={gpus}",
+            "--exclusive",
+            f"--time={args.time_minutes}",
+            f"--job-name={args.runner_name}",
+        ]
+        for field, flag in (
+            ("account", "account"),
+            ("qos", "qos"),
+            ("exclude_nodes", "exclude"),
+        ):
+            if profile.get(field):
+                allocation.append(f"--{flag}={profile[field]}")
+        hw = family(cell["runner"])
+        if hw in ("b200", "b300", "gb200", "gb300"):
+            allocation.append("--mem=0")
+        if hw in ("gb200", "gb300"):
+            allocation.append("--cpus-per-task=35")
+        if is_amd(cell["runner"]):
+            allocation.append(f"--cpus-per-task={profile['cpus_per_node'] // gpus}")
+        command(allocation, root / "allocation.log")
+        jobs = allocation_ids(root)
+        if len(jobs) != 1:
+            raise RuntimeError("could not identify the unique Slurm allocation")
+        job = jobs[0]
+        cache = base / "containers"
+        launcher = stage / "source/operatorx/ci.py"
+        import_command = [
+            "srun",
+            f"--jobid={job}",
+            "--nodes=1",
+            "--ntasks=1",
+            "--chdir=/tmp",
+            "python3",
+            str(launcher),
+            "import",
+            "--cache",
+            str(cache),
+            "--image",
+            cell["image"],
+            "--digest",
+            cell["digest"],
+            "--image-platform",
+            image_platform,
+        ]
+        # Import on the allocated architecture, including B300: its submit host
+        # lacks PyTorch extraction space, as the inference launcher notes.
+        import_env = dict(os.environ)
+        if profile.get("enroot_cache_path"):
+            import_env["ENROOT_CACHE_PATH"] = profile["enroot_cache_path"]
+        if hardware.get("enroot_defaults"):
+            import_env["OPERATORX_ENROOT_DEFAULTS"] = "1"
+        command(import_command, root / "import.log", env=import_env)
+        key = image_key(cell["image"], cell["digest"], image_platform)
+        env = dict(os.environ)
+        env.update(
+            OPERATORX_CLUSTER=cell["cluster"],
+            OPERATORX_CONTAINER_IMAGE=cell["image"],
+            OPERATORX_IMAGE_DIGEST=cell["digest"],
+            OPERATORX_IMAGE_PLATFORM=image_platform,
+            OPERATORX_GPUS_PER_NODE=str(gpus),
+            OPERATORX_SOURCE_SHA=args.source_sha,
+            OPERATORX_GITHUB_RUN_ID=args.run_id,
+            OPERATORX_GITHUB_RUN_ATTEMPT=args.attempt,
+            OPERATORX_SHARD_ID=cell["id"],
+            OPERATORX_BACKENDS=",".join(cell["backends"]),
+            OPERATORX_MODE=cell.get("mode", "timing"),
+            OPERATORX_RECIPE=cell.get("recipe", ""),
+            OPERATORX_ENGINE_ARGS=json.dumps(cell.get("engine_args") or {}),
+            OPERATORX_TESTLISTS=",".join(
+                sorted({c["testlist"] for c in cell["cases"]})
+            ),
+            PYTHONPATH="/opx/source",
+            PYTHONDONTWRITEBYTECODE="1",
+            WORLD_SIZE=str(cell["world_size"]),
+            MASTER_ADDR="127.0.0.1",
+            MASTER_PORT="29500",
+        )
+        env.update(cell.get("env", {}))  # the InferenceX recipe's launch env
+        mounts = f"{stage}:/opx"
+        # NVIDIA images carry no Nsight Compute; counters runs mount the node's newest.
+        if cell.get("mode") == "counters" and not is_amd(cell["runner"]):
+            found = subprocess.run(
+                ["srun", f"--jobid={job}", "--nodes=1", "--ntasks=1", "bash", "-c", NCU_SEARCH],
+                capture_output=True, text=True, timeout=120,
+            ).stdout.split()
+            (root / "ncu.log").write_text("\n".join(found) + "\n")
+            ncu = pick_ncu(found)
+            if ncu is not None:
+                # ncu is a wrapper that finds its install next to itself (../), so mount the
+                # whole install tree at the same path
+                mounts += f",{ncu.parent.parent}:{ncu.parent.parent}"
+                env["OPERATORX_NCU"] = str(ncu)
+        if hw in ("mi300x", "mi325x"):
+            mounts += ",/dev/kfd:/dev/kfd,/dev/dri:/dev/dri"
+        run = [
+            "srun",
+            f"--jobid={job}",
+            "--nodes=1",
+            f"--ntasks={cell['world_size']}",
+            f"--ntasks-per-node={cell['world_size']}",
+            "--kill-on-bad-exit=1",
+            "--chdir=/tmp",
+            f"--container-image={cache / (key + '.sqsh')}",
+            f"--container-mounts={mounts}",
+            "--container-workdir=/opx",
+            "--no-container-mount-home",
+            "--no-container-entrypoint",
+            "--container-writable",
+            "--export=ALL",
+        ]
+        if hw in ("h200", "b300", "gb200", "gb300") or is_amd(cell["runner"]):
+            run.append("--container-remap-root")
+        if hw == "b300":
+            run.append("--mpi=none")
+        # The Python entrypoint preserves the allocated GPU mask without a shell. Run it
+        # by path: an image's own PYTHONPATH (ROCm images set one) replaces the host's.
+        run += ["python3", "/opx/source/operatorx/ci.py", "rank"]
+        command(run, root / "benchmark.log", env=env)
+        rc = 0
+    finally:
+        # Stop writers before collecting; failed cleanup retains the evidence.
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_IGN)
+        finalize(root, args.cleanup_seconds)
+        write_json(
+            root / "status.json", {"exit_code": rc, "slurm_jobs": allocation_ids(root)}
+        )
+
+
+def rank() -> None:
+    for key in ("SLURM_PROCID", "SLURM_LOCALID", "WORLD_SIZE"):
+        if not os.environ.get(key):
+            raise ValueError(f"required rank input missing: {key}")
+    os.environ["RANK"] = os.environ["SLURM_PROCID"]
+    source = "/opx/source"
+    paths = [x for x in os.environ.get("PYTHONPATH", "").split(":") if x and x != source]
+    os.environ["PYTHONPATH"] = ":".join([source, *paths])
+    os.environ["LOCAL_RANK"] = os.environ["SLURM_LOCALID"]
+    cache = (
+        Path("/tmp") / f"operatorx-{os.environ['SLURM_JOB_ID']}-{os.environ['RANK']}"
+    )
+    cache.mkdir(mode=0o700, exist_ok=True)
+    os.environ.update(
+        HOME=str(cache),
+        TRITON_CACHE_DIR=str(cache / "triton"),
+        MPLCONFIGDIR=str(cache / "matplotlib"),
+    )
+    bench = [
+        sys.executable,
+        "-m",
+        "operatorx",
+        "--strict",
+        "--testlist-dir",
+        "/opx/testlists",
+        "--results-dir",
+        "/opx/results",
+    ]
+    if os.environ.get("OPERATORX_MODE", "timing") != "counters":
+        os.execv(sys.executable, bench)
+    # One profiled replay per op, marked so counters join to ops; no timing warmups.
+    os.environ.update(
+        OPERATORX_PROFILE="1",
+        OPERATORX_PROFILE_MARKERS="1",
+        OPERATORX_PROFILE_ITERS="1",
+        OPERATORX_WARMUP_MIN_S="0",
+        OPERATORX_FIRST_WARMUP_S="0",
+        OPERATORX_COOLDOWN_RATIO="0",
+        OPERATORX_THROTTLE_RETRIES="0",
+    )
+    out = Path("/opx/results/counters")
+    out.mkdir(parents=True, exist_ok=True)
+    rank_id = os.environ["RANK"]
+    rocprof = shutil.which("rocprofv3")
+    if rocprof:
+        for i, (tag, counters) in enumerate(ROCPROF_PASSES.items()):
+            argv = [rocprof, "--pmc", *counters, "--kernel-trace", "--marker-trace",
+                    "--output-format", "csv", "-d", str(out / tag), "-o", f"rank{rank_id}",
+                    "--", *bench]
+            if i:  # results rows come from the first pass only
+                argv[-1] = str(cache / f"results-{tag}")
+            subprocess.run(argv, check=True)
+        return
+    ncu = os.environ.get("OPERATORX_NCU") or shutil.which("ncu")
+    if not ncu:
+        raise RuntimeError(
+            "counters mode needs ncu: none in the image, and the node has none under "
+            "/opt/nvidia/nsight-compute, /usr/local/cuda*/nsight-compute* or on PATH")
+    os.execv(ncu, [
+        ncu, "--clock-control", "none", "--target-processes", "all",
+        "--nvtx", "--nvtx-include", "regex:opx[0-9]+/", "--metrics", NCU_METRICS,
+        "--csv", "--log-file", str(out / f"ncu-rank{rank_id}.csv"), *bench,
+    ])
+
+
+def summarize(manifest: dict, artifacts: Path) -> dict:
+    latest = {}
+    for execution in artifacts.rglob("execution.json"):
+        data = json.loads(execution.read_text())
+        if (
+            data["run_id"] != manifest["run_id"]
+            or data["source_sha"] != manifest["source_sha"]
+        ):
+            raise ValueError("artifact provenance does not match the requested run")
+        identity = data["cell"]["id"]
+        attempt = int(data["attempt"])
+        if identity not in latest or attempt > latest[identity][0]:
+            latest[identity] = (attempt, execution.parent)
+    rows = []
+    for cell in manifest["include"]:
+        record = {
+            "shard": cell["id"],
+            "requested_shapes": len(cell["cases"]),
+            "status": "missing",
+            "ok": 0,
+            "unsupported": 0,
+            "error": 0,
+        }
+        if cell["id"] in latest:
+            attempt, directory = latest[cell["id"]]
+            record["attempt"] = attempt
+            for result in (directory / "results").rglob("*.json"):
+                for row in json.loads(result.read_text())["rows"]:
+                    status = row["status"]
+                    if status not in ("ok", "unsupported", "error"):
+                        raise ValueError(f"invalid result status: {status}")
+                    record[status] += 1
+            status_file = directory / "status.json"
+            success = (
+                status_file.exists()
+                and json.loads(status_file.read_text())["exit_code"] == 0
+                and record["ok"] > 0
+                and record["error"] == 0
+            )
+            record["status"] = "success" if success else "failed"
+        rows.append(record)
+    return {
+        "shards": rows,
+        "success": bool(rows) and all(r["status"] == "success" for r in rows),
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("plan")
+    for name in (
+        "runner",
+        "backends",
+        "testlists",
+        "world-sizes",
+        "run-id",
+        "attempt",
+        "source-sha",
+    ):
+        p.add_argument("--" + name, required=True)
+    p.add_argument("--chunk-size", required=True, type=int)
+    p.add_argument("--mode", default="timing", choices=MODES)
+    p.add_argument("--platform-config", required=True, type=Path)
+    p.add_argument("--out", required=True, type=Path)
+    p = sub.add_parser("execute")
+    for name in ("shard", "run-id", "attempt", "source-sha", "runner-name"):
+        p.add_argument("--" + name, required=True)
+    p.add_argument("--time-minutes", required=True, type=int)
+    p.add_argument("--cleanup-seconds", required=True, type=int)
+    p.add_argument("--manifest", required=True, type=Path)
+    p.add_argument("--platform-config", required=True, type=Path)
+    p.add_argument("--output", required=True, type=Path)
+    p = sub.add_parser("import")
+    p.add_argument("--cache", required=True, type=Path)
+    p.add_argument("--image", required=True)
+    p.add_argument("--digest", required=True)
+    p.add_argument(
+        "--image-platform", required=True, choices=("linux/amd64", "linux/arm64")
+    )
+    sub.add_parser("rank")
+    p = sub.add_parser("finalize")
+    p.add_argument("--cleanup-seconds", required=True, type=int)
+    p.add_argument("--output", required=True, type=Path)
+    p = sub.add_parser("summarize")
+    p.add_argument("--manifest", required=True, type=Path)
+    p.add_argument("--artifacts", required=True, type=Path)
+    p.add_argument("--out", required=True, type=Path)
+    p = sub.add_parser("recover")
+    p.add_argument("--cleanup-seconds", required=True, type=int)
+    p.add_argument("--artifacts", required=True, type=Path)
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--runner", required=True, choices=tuple(RUNNERS))
+    p.add_argument("--platform-config", required=True, type=Path)
+    args = parser.parse_args()
+    if args.command == "plan":
+        import tomllib
+
+        from operatorx import recipes
+
+        names = args.testlists.split(",")
+        if any(not re.fullmatch(r"[A-Za-z0-9_-]+", n) for n in names):
+            raise ValueError("invalid testlist name")
+        lists = {
+            n: json.loads((ROOT / "testlists" / f"{n}.json").read_text()) for n in names
+        }
+        vendor = "amd" if is_amd(args.runner) else "nvidia"
+        images = tomllib.loads((ROOT / "containers.toml").read_text())[vendor]
+        # Fail here, before any node is allocated, for a backend with no module.
+        missing = [
+            b for b in args.backends.split(",")
+            if not (ROOT / "runners" / vendor / "backends" / f"{b}.py").is_file()
+        ]
+        if missing:
+            raise ValueError(f"no {vendor} backend module for: {', '.join(missing)}")
+        result = plan(
+            args.runner,
+            args.backends.split(","),
+            lists,
+            images,
+            [int(w) for w in args.world_sizes.split(",")],
+            args.chunk_size,
+            load_platforms(args.platform_config),
+            args.mode,
+            find_recipe=recipes.find,
+        )
+        digests = {c["image"]: "" for c in result["include"]}
+        for image in digests:
+            digests[image] = probe_module().resolve_image_digest(image)
+        for cell in result["include"]:
+            # a recipe whose image tag the registry no longer serves (pruned nightlies) runs on
+            # the backend's own image with the recipe's env; the manifest records the swap
+            if not digests[cell["image"]] and cell.get("recipe"):
+                cell["recipe_image_unavailable"] = cell["image"]
+                cell["image"] = images[cell["backends"][0]]["image"]
+                if not digests.get(cell["image"]):
+                    digests[cell["image"]] = probe_module().resolve_image_digest(cell["image"])
+        for image in {c["image"] for c in result["include"]}:
+            if not digests.get(image):
+                raise RuntimeError(f"cannot resolve image digest: {image}")
+        for cell in result["include"]:
+            cell["digest"] = digests[cell["image"]]
+            cell["queue-token"] = hashlib.sha256(
+                f"{args.run_id}:{args.attempt}:{cell['id']}".encode()
+            ).hexdigest()[:32]
+        result.update(
+            source_sha=args.source_sha, run_id=args.run_id, attempt=args.attempt
+        )
+        write_json(args.out, result)
+        slim = {
+            "include": [
+                {k: c[k] for k in ("id", "runner", "nodes", "queue-token")}
+                for c in result["include"]
+            ]
+        }
+        print(json.dumps(slim, separators=(",", ":")))
+    elif args.command == "summarize":
+        report = summarize(json.loads(args.manifest.read_text()), args.artifacts)
+        write_json(args.out, report)
+        print(
+            "| Shard | Status | Shapes requested | OK rows | "
+            "Unsupported rows | Error rows |"
+        )
+        print("| --- | --- | ---: | ---: | ---: | ---: |")
+        for row in report["shards"]:
+            print(
+                f"| {row['shard']} | {row['status']} | {row['requested_shapes']} | "
+                f"{row['ok']} | {row['unsupported']} | {row['error']} |"
+            )
+        raise SystemExit(0 if report["success"] else 1)
+    elif args.command == "recover":
+        recover(
+            args.artifacts,
+            args.run_id,
+            args.runner,
+            args.platform_config,
+            args.cleanup_seconds,
+        )
+    elif args.command == "execute":
+        execute(args)
+    elif args.command == "finalize":
+        finalize(args.output, args.cleanup_seconds)
+    elif args.command == "import":
+        import_image(args)
+    else:
+        rank()
+
+
+if __name__ == "__main__":
+    main()
